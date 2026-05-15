@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper GTK
+Comment=Push-to-talk desktop dictation with whisper.cpp
+Exec=env GDK_BACKEND=x11 whisper-gtk
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Audio;
+StartupNotify=false
