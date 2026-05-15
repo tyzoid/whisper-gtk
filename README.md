@@ -1,6 +1,8 @@
 # Whisper GTK
 
 > Warning: This project was vibe coded with minimal review. Use and package it with that in mind.
+>
+> Note: Per US copyright law, works authored by AI are not protected by copyright, and are thus Public Domain. However, the human-authored elements of this project are protected by copyright, and are licensed under GPL v3.
 
 Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation. It listens for a configurable global hotkey, records microphone audio while the hotkey is held, shows a compact recording overlay, transcribes the capture with `whisper.cpp-base.en`, and inserts the resulting text into the active application. It also provides a StatusNotifier tray icon with Settings and Quit actions.
 
