@@ -168,18 +168,12 @@ impl AppController {
         self.set_recording_ui(false);
         let sender = self.event_sender.clone();
         let sequence = self.next_transcription_sequence;
+        let configured_model_path = self.config.lock().unwrap().model_path.clone();
         self.next_transcription_sequence = self.next_transcription_sequence.saturating_add(1);
         std::thread::spawn(move || {
             let result = session.stop().and_then(|stop| match stop {
-                RecordingStop::Captured(wav) => {
-                    let transcript = transcribe(&wav);
-                    if let Err(err) = std::fs::remove_file(&wav) {
-                        eprintln!(
-                            "failed to remove temporary recording {}: {err}",
-                            wav.display()
-                        );
-                    }
-                    match transcript {
+                RecordingStop::Captured(samples) => {
+                    match transcribe(&samples, configured_model_path.as_deref()) {
                         Ok(text) => Ok(Some(text)),
                         Err(err) => Err(err),
                     }
@@ -251,9 +245,7 @@ impl AppController {
         self.set_recording_ui(false);
         if let Some(session) = self.recording.take() {
             std::thread::spawn(move || {
-                if let Ok(RecordingStop::Captured(wav)) = session.stop() {
-                    let _ = std::fs::remove_file(wav);
-                }
+                let _ = session.stop();
             });
         }
         self.application.quit();

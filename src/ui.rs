@@ -1,10 +1,11 @@
 use crate::config::{AppConfig, OutputMode};
-use crate::services::{list_audio_sources, Hotkey};
+use crate::services::{default_whisper_model_dir, list_audio_sources, list_whisper_models, Hotkey};
 use gtk::gdk;
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, CssProvider,
-    DrawingArea, Label, Orientation, SpinButton, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    DrawingArea, FileChooserAction, FileChooserNative, Label, Orientation, ResponseType,
+    SpinButton, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use std::cell::RefCell;
 use std::f64::consts::TAU;
@@ -286,6 +287,9 @@ pub fn build_settings_window(
     let duration_heading = Label::new(Some("Max Recording Duration"));
     duration_heading.set_halign(Align::Start);
     let duration_spin = SpinButton::with_range(5.0, 180.0, 1.0);
+    let model_heading = Label::new(Some("Whisper Model"));
+    model_heading.set_halign(Align::Start);
+    let model_combo = ComboBoxText::new();
 
     let refresh_sources = |audio_combo: &ComboBoxText, config: &AppConfig| {
         audio_combo.remove_all();
@@ -317,6 +321,31 @@ pub fn build_settings_window(
             OutputMode::ClipboardPaste => "clipboard",
         }));
         duration_spin.set_value(cfg.max_recording_secs as f64);
+
+        model_combo.remove_all();
+        for model_path in list_whisper_models() {
+            let id = model_path.to_string_lossy().to_string();
+            let label = model_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&id)
+                .to_string();
+            model_combo.append(Some(&id), &label);
+        }
+        model_combo.append(Some("other"), "Other...");
+        if let Some(path) = cfg.model_path.as_deref() {
+            model_combo.set_active_id(Some(path));
+            if model_combo.active_id().is_none() {
+                model_combo.set_active_id(Some("other"));
+            }
+        } else {
+            let default = default_whisper_model_dir().join("ggml-base.en.bin");
+            let default_id = default.to_string_lossy().to_string();
+            model_combo.set_active_id(Some(&default_id));
+            if model_combo.active_id().is_none() {
+                model_combo.set_active(0);
+            }
+        }
     }
 
     let capture_mode = std::rc::Rc::new(std::cell::RefCell::new(false));
@@ -386,6 +415,45 @@ pub fn build_settings_window(
         }
     });
 
+    let config_for_model = config.clone();
+    let window_for_model = window.clone();
+    model_combo.connect_changed(move |combo| {
+        let Some(id) = combo.active_id().map(|v| v.to_string()) else {
+            return;
+        };
+        if id == "other" {
+            let chooser = FileChooserNative::builder()
+                .title("Select ggml model")
+                .action(FileChooserAction::Open)
+                .transient_for(&window_for_model)
+                .accept_label("Select")
+                .cancel_label("Cancel")
+                .build();
+            chooser.connect_response({
+                let combo = combo.clone();
+                let config_for_model = config_for_model.clone();
+                move |dialog, response| {
+                    if response == ResponseType::Accept {
+                        if let Some(file) = dialog.file().and_then(|f| f.path()) {
+                            let path = file.to_string_lossy().to_string();
+                            combo.append(Some(&path), &path);
+                            combo.set_active_id(Some(&path));
+                            let mut cfg = config_for_model.lock().unwrap();
+                            cfg.model_path = Some(path);
+                            let _ = cfg.save();
+                        }
+                    }
+                    dialog.destroy();
+                }
+            });
+            chooser.show();
+            return;
+        }
+        let mut cfg = config_for_model.lock().unwrap();
+        cfg.model_path = Some(id);
+        let _ = cfg.save();
+    });
+
     let config_for_duration = config.clone();
     duration_spin.connect_value_changed(move |spin| {
         let value = spin.value().round().clamp(5.0, 180.0) as u32;
@@ -406,6 +474,8 @@ pub fn build_settings_window(
     root.append(&mode_combo);
     root.append(&duration_heading);
     root.append(&duration_spin);
+    root.append(&model_heading);
+    root.append(&model_combo);
 
     window.set_child(Some(&root));
     window

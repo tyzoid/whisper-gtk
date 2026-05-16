@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub audio_source: Option<String>,
     pub output_mode: OutputMode,
     pub max_recording_secs: u32,
+    pub model_path: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -30,6 +31,7 @@ impl Default for AppConfig {
             audio_source: None,
             output_mode: OutputMode::DirectTyping,
             max_recording_secs: DEFAULT_MAX_RECORDING_SECS,
+            model_path: None,
         }
     }
 }

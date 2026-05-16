@@ -1,13 +1,11 @@
 use crate::config::{AppConfig, OutputMode};
 use crate::services::{
-    build_recording_command, build_transcribe_command, hotkey_matches, keycode_is_down,
-    overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats, Hotkey,
-    MonitorGeometry, RecordingGeneration,
+    build_recording_command, hotkey_matches, keycode_is_down, overlay_position_for_monitor,
+    parse_x11_hotkey, raw_to_wav, AudioStats, Hotkey, MonitorGeometry, RecordingGeneration,
 };
 use crate::ui::WaveformState;
 use gtk::gdk;
 use std::fs;
-use std::path::PathBuf;
 
 fn command_args(command: &std::process::Command) -> Vec<String> {
     command
@@ -23,6 +21,7 @@ fn config_roundtrip() {
         audio_source: Some("alsa_input".to_string()),
         output_mode: OutputMode::ClipboardPaste,
         max_recording_secs: 42,
+        model_path: None,
     };
     let text = serde_json::to_string(&cfg).unwrap();
     let decoded: AppConfig = serde_json::from_str(&text).unwrap();
@@ -39,6 +38,7 @@ fn config_persists_to_custom_path() {
         audio_source: Some("default-source".to_string()),
         output_mode: OutputMode::ClipboardPaste,
         max_recording_secs: 55,
+        model_path: None,
     };
     cfg.save_to(&path).unwrap();
     let loaded = AppConfig::load_from(&path);
@@ -202,19 +202,6 @@ fn pcm_samples(amplitude: f32, samples: usize) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
-}
-
-#[test]
-fn transcribe_command_is_fixed() {
-    let command = build_transcribe_command(&PathBuf::from("/tmp/in.wav"));
-    assert_eq!(
-        command.get_program().to_string_lossy(),
-        "whisper.cpp-base.en"
-    );
-    assert_eq!(
-        command_args(&command),
-        vec!["-np", "-nt", "-ac", "1500", "-mc", "50", "/tmp/in.wav"]
-    );
 }
 
 #[test]

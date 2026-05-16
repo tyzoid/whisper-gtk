@@ -12,12 +12,35 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const SAMPLE_RATE: u32 = 16_000;
 const BYTES_PER_SAMPLE: u64 = 2;
 const MIN_RECORDING_DURATION: Duration = Duration::from_millis(300);
 const MIN_SPEECH_DURATION: Duration = Duration::from_millis(200);
 const SPEECH_RMS_THRESHOLD: f32 = 0.015;
+
+pub fn default_whisper_model_dir() -> PathBuf {
+    PathBuf::from("/usr/share/whisper.cpp/models")
+}
+
+pub fn list_whisper_models() -> Vec<PathBuf> {
+    let dir = default_whisper_model_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let mut models = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ggml") && name.ends_with(".bin"))
+        })
+        .collect::<Vec<_>>();
+    models.sort();
+    models
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
@@ -95,13 +118,6 @@ pub fn build_recording_command(config: &AppConfig) -> Command {
     command
 }
 
-pub fn build_transcribe_command(path: &Path) -> Command {
-    let mut command = Command::new("whisper.cpp-base.en");
-    command.args(["-np", "-nt", "-ac", "1500", "-mc", "50"]);
-    command.arg(path);
-    command
-}
-
 pub struct RecordingSession {
     child: Child,
     raw_path: PathBuf,
@@ -111,7 +127,7 @@ pub struct RecordingSession {
 }
 
 pub enum RecordingStop {
-    Captured(PathBuf),
+    Captured(Vec<f32>),
     Discarded(AudioStats),
 }
 
@@ -159,14 +175,9 @@ impl RecordingSession {
             return Ok(RecordingStop::Discarded(stats));
         }
 
-        let wav_path = temp_path("whisper-gtk-recording.wav");
-        if let Err(err) = raw_to_wav(&self.raw_path, &wav_path) {
-            let _ = fs::remove_file(&self.raw_path);
-            let _ = fs::remove_file(&wav_path);
-            return Err(err);
-        }
+        let samples = read_pcm_f32(&self.raw_path)?;
         let _ = fs::remove_file(&self.raw_path);
-        Ok(RecordingStop::Captured(wav_path))
+        Ok(RecordingStop::Captured(samples))
     }
 
     pub fn started_at(&self) -> Instant {
@@ -331,16 +342,68 @@ fn write_wav_header(writer: &mut File, data_len: u32) -> io::Result<()> {
     Ok(())
 }
 
-pub fn transcribe(path: &Path) -> io::Result<String> {
-    let output = build_transcribe_command(path).output()?;
+fn read_pcm_f32(path: &std::path::Path) -> io::Result<Vec<f32>> {
+    let bytes = fs::read(path)?;
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        samples.push(sample as f32 / i16::MAX as f32);
+    }
+    Ok(samples)
+}
 
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+fn whisper_model_path(configured: Option<&str>) -> PathBuf {
+    if let Some(path) = configured {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("WHISPER_MODEL_PATH") {
+        return PathBuf::from(path);
+    }
+    default_whisper_model_dir().join("ggml-base.en.bin")
+}
+
+pub fn transcribe(samples: &[f32], configured_model_path: Option<&str>) -> io::Result<String> {
+    let model_path = whisper_model_path(configured_model_path);
+    let ctx = WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid whisper model path"))?,
+        WhisperContextParameters::default(),
+    )
+    .map_err(|err| {
+        io::Error::other(format!(
+            "failed to load whisper model {}: {err}",
+            model_path.display()
+        ))
+    })?;
+
+    let mut state = ctx
+        .create_state()
+        .map_err(|err| io::Error::other(format!("failed to create whisper state: {err}")))?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(4);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_special(false);
+    params.set_translate(false);
+
+    state
+        .full(params, samples)
+        .map_err(|err| io::Error::other(format!("whisper inference failed: {err}")))?;
+
+    let mut text = String::new();
+    let segments = state.full_n_segments();
+    for idx in 0..segments {
+        let segment = state
+            .full_get_segment_text(idx)
+            .map_err(|err| io::Error::other(format!("failed reading whisper segment: {err}")))?;
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(segment.trim());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(text.trim().to_string())
 }
 
 pub fn type_text(text: &str) -> io::Result<()> {
