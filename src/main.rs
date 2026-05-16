@@ -10,17 +10,21 @@ mod ui;
 use crate::config::AppConfig;
 use crate::native::TrayIndicator;
 use crate::services::{
-    focused_monitor_geometry, overlay_position_for_monitor, run_output_mode,
-    spawn_xev_hotkey_listener, transcribe, RecordingGeneration, RecordingSession, RecordingStop,
+    focused_monitor_geometry, overlay_position_for_monitor, preload_whisper_state, run_output_mode,
+    spawn_xev_hotkey_listener, transcribe, transcribe_with_state, RecordingGeneration,
+    RecordingSession, RecordingStop,
 };
 use crate::ui::{build_overlay, build_settings_window, OverlayMeter};
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use whisper_rs::WhisperState;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -40,6 +44,7 @@ pub struct AppController {
     pub tray: Option<TrayIndicator>,
     pub recording: Option<RecordingSession>,
     pub recording_generation: RecordingGeneration,
+    pub preloaded_model: Option<JoinHandle<Option<WhisperState>>>,
     pub max_duration_timer: Option<gtk::glib::SourceId>,
     pub overlay_tick_timer: Option<gtk::glib::SourceId>,
     pub self_weak: Option<Weak<RefCell<AppController>>>,
@@ -66,6 +71,7 @@ impl AppController {
             tray: None,
             recording: None,
             recording_generation: RecordingGeneration::default(),
+            preloaded_model: None,
             max_duration_timer: None,
             overlay_tick_timer: None,
             self_weak: None,
@@ -113,6 +119,19 @@ impl AppController {
                 self.cancel_max_duration_timer();
                 self.cancel_overlay_tick_timer();
                 self.recording = Some(session);
+                let sender = self.event_sender.clone();
+                let configured_model_path = cfg.model_path.clone();
+                self.preloaded_model =
+                    Some(std::thread::spawn(move || {
+                        match preload_whisper_state(configured_model_path.as_deref()) {
+                            Ok(state) => Some(state),
+                            Err(err) => {
+                                let _ = sender
+                                    .send(AppEvent::Error(format!("model preload failed: {err}")));
+                                None
+                            }
+                        }
+                    }));
                 let generation = self.recording_generation.next();
                 self.set_recording_ui(true);
                 let window = self.overlay_window.clone();
@@ -168,29 +187,46 @@ impl AppController {
         self.set_recording_ui(false);
         let sender = self.event_sender.clone();
         let sequence = self.next_transcription_sequence;
+        let cfg = self.config.lock().unwrap().clone();
+        let configured_model_path = cfg.model_path.clone();
+        let whisper_threads = cfg.whisper_threads as usize;
+        let preloaded_model = self.preloaded_model.take();
+        let had_preload = preloaded_model.is_some();
         self.next_transcription_sequence = self.next_transcription_sequence.saturating_add(1);
         std::thread::spawn(move || {
-            let result = session.stop().and_then(|stop| match stop {
-                RecordingStop::Captured(wav) => {
-                    let transcript = transcribe(&wav);
-                    if let Err(err) = std::fs::remove_file(&wav) {
+            let result = session.stop().and_then(|stop| {
+                let model = match preloaded_model {
+                    Some(handle) => match handle.join() {
+                        Ok(model) => model,
+                        Err(_) => {
+                            let _ = sender
+                                .send(AppEvent::Error("model preload thread panicked".to_string()));
+                            None
+                        }
+                    },
+                    None => preload_whisper_state(configured_model_path.as_deref()).ok(),
+                };
+                match stop {
+                    RecordingStop::Captured(samples) => match model {
+                        Some(model) => {
+                            transcribe_with_state(model, &samples, whisper_threads).map(Some)
+                        }
+                        None if had_preload => {
+                            Err(io::Error::other("whisper model was not preloaded"))
+                        }
+                        None => {
+                            transcribe(&samples, configured_model_path.as_deref(), whisper_threads)
+                                .map(Some)
+                        }
+                    },
+                    RecordingStop::Discarded(stats) => {
                         eprintln!(
-                            "failed to remove temporary recording {}: {err}",
-                            wav.display()
+                            "recording discarded: duration={}ms speech={}ms",
+                            stats.duration().as_millis(),
+                            stats.speech_duration().as_millis()
                         );
+                        Ok(None)
                     }
-                    match transcript {
-                        Ok(text) => Ok(Some(text)),
-                        Err(err) => Err(err),
-                    }
-                }
-                RecordingStop::Discarded(stats) => {
-                    eprintln!(
-                        "recording discarded: duration={}ms speech={}ms",
-                        stats.duration().as_millis(),
-                        stats.speech_duration().as_millis()
-                    );
-                    Ok(None)
                 }
             });
             match result {
@@ -251,9 +287,7 @@ impl AppController {
         self.set_recording_ui(false);
         if let Some(session) = self.recording.take() {
             std::thread::spawn(move || {
-                if let Ok(RecordingStop::Captured(wav)) = session.stop() {
-                    let _ = std::fs::remove_file(wav);
-                }
+                let _ = session.stop();
             });
         }
         self.application.quit();

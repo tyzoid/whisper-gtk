@@ -1,13 +1,13 @@
-use crate::config::{AppConfig, OutputMode};
+use crate::config::{physical_core_count_from_cpuinfo, AppConfig, OutputMode};
 use crate::services::{
-    build_recording_command, build_transcribe_command, hotkey_matches, keycode_is_down,
+    build_recording_command, hotkey_matches, keycode_is_down, list_whisper_models_in,
     overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats, Hotkey,
     MonitorGeometry, RecordingGeneration,
 };
-use crate::ui::WaveformState;
+use crate::ui::{audio_source_selection_to_config, output_mode_selection_to_config, WaveformState};
 use gtk::gdk;
 use std::fs;
-use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn command_args(command: &std::process::Command) -> Vec<String> {
     command
@@ -23,6 +23,8 @@ fn config_roundtrip() {
         audio_source: Some("alsa_input".to_string()),
         output_mode: OutputMode::ClipboardPaste,
         max_recording_secs: 42,
+        model_path: None,
+        whisper_threads: 8,
     };
     let text = serde_json::to_string(&cfg).unwrap();
     let decoded: AppConfig = serde_json::from_str(&text).unwrap();
@@ -39,6 +41,8 @@ fn config_persists_to_custom_path() {
         audio_source: Some("default-source".to_string()),
         output_mode: OutputMode::ClipboardPaste,
         max_recording_secs: 55,
+        model_path: None,
+        whisper_threads: 8,
     };
     cfg.save_to(&path).unwrap();
     let loaded = AppConfig::load_from(&path);
@@ -62,6 +66,24 @@ fn config_normalize_clamps_max_recording_duration() {
     };
     too_high.normalize();
     assert_eq!(too_high.max_recording_secs, 180);
+}
+
+#[test]
+fn physical_core_count_parser_counts_unique_cores() {
+    let cpuinfo = "\
+processor   : 0
+physical id : 0
+core id     : 0
+
+processor   : 1
+physical id : 0
+core id     : 1
+
+processor   : 2
+physical id : 0
+core id     : 0
+";
+    assert_eq!(physical_core_count_from_cpuinfo(cpuinfo), Some(2));
 }
 
 #[test]
@@ -135,20 +157,23 @@ fn overlay_position_targets_monitor_centerline() {
 }
 
 #[test]
-fn waveform_state_reflects_level_and_motion() {
-    let quiet = WaveformState::default().bar_heights(6);
-    let mut loud_state = WaveformState::default();
-    loud_state.set_level(1.0);
-    let loud = loud_state.bar_heights(6);
-    assert_eq!(quiet.len(), 6);
-    assert_eq!(loud.len(), 6);
-    assert!(loud.iter().sum::<f64>() > quiet.iter().sum::<f64>());
+fn waveform_state_scrolls_level_history() {
+    let mut state = WaveformState::default();
+    let initial = state.bar_heights(11);
+    assert_eq!(initial.len(), 11);
+    assert!(initial.iter().all(|height| (*height - 0.16).abs() < 1e-6));
 
-    let mut animated = WaveformState::default();
-    let before = animated.bar_heights(6);
-    animated.advance();
-    let after = animated.bar_heights(6);
-    assert_ne!(before, after);
+    state.set_level(1.0);
+    state.advance();
+    let first = state.bar_heights(11);
+    assert!((first[10] - 0.90).abs() < 1e-6);
+    assert!((first[9] - 0.16).abs() < 1e-6);
+
+    state.set_level(0.5);
+    state.advance();
+    let second = state.bar_heights(11);
+    assert!((second[10] - 0.53).abs() < 1e-6);
+    assert!((second[9] - 0.90).abs() < 1e-6);
 }
 
 #[test]
@@ -177,6 +202,7 @@ fn audio_gate_allows_sustained_speech() {
 fn recording_command_uses_configured_source() {
     let cfg = AppConfig {
         audio_source: Some("alsa_input.usb".to_string()),
+        whisper_threads: 8,
         ..AppConfig::default()
     };
     let command = build_recording_command(&cfg);
@@ -195,6 +221,54 @@ fn recording_command_uses_configured_source() {
     );
 }
 
+#[test]
+fn audio_source_selection_maps_default_to_none() {
+    assert_eq!(audio_source_selection_to_config("Default source"), None);
+    assert_eq!(
+        audio_source_selection_to_config("alsa_input.usb"),
+        Some("alsa_input.usb".to_string())
+    );
+}
+
+#[test]
+fn output_mode_selection_maps_dropdown_values() {
+    assert_eq!(
+        output_mode_selection_to_config("Direct typing"),
+        Some(OutputMode::DirectTyping)
+    );
+    assert_eq!(
+        output_mode_selection_to_config("Clipboard paste"),
+        Some(OutputMode::ClipboardPaste)
+    );
+    assert_eq!(output_mode_selection_to_config("Other"), None);
+}
+
+#[test]
+fn whisper_model_scanner_matches_packaged_layout() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("whisper-gtk-model-scan-{stamp}"));
+    let share = root.join("usr/share");
+    let model_dir_a = share.join("whisper.cpp-model-base.en");
+    let model_dir_b = share.join("whisper.cpp-model-large-v3-q5_0");
+    fs::create_dir_all(&model_dir_a).unwrap();
+    fs::create_dir_all(&model_dir_b).unwrap();
+    fs::write(model_dir_a.join("ggml-base.en.bin"), b"a").unwrap();
+    fs::write(model_dir_b.join("ggml-large-v3-q5_0.bin"), b"b").unwrap();
+    fs::write(model_dir_b.join("not-a-model.txt"), b"c").unwrap();
+
+    let models = list_whisper_models_in(&share);
+    let expected = vec![
+        model_dir_a.join("ggml-base.en.bin"),
+        model_dir_b.join("ggml-large-v3-q5_0.bin"),
+    ];
+    assert_eq!(models, expected);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn pcm_samples(amplitude: f32, samples: usize) -> Vec<u8> {
     let sample = (amplitude.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
     let mut bytes = Vec::with_capacity(samples * 2);
@@ -202,19 +276,6 @@ fn pcm_samples(amplitude: f32, samples: usize) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
-}
-
-#[test]
-fn transcribe_command_is_fixed() {
-    let command = build_transcribe_command(&PathBuf::from("/tmp/in.wav"));
-    assert_eq!(
-        command.get_program().to_string_lossy(),
-        "whisper.cpp-base.en"
-    );
-    assert_eq!(
-        command_args(&command),
-        vec!["-np", "-nt", "-ac", "1500", "-mc", "50", "/tmp/in.wav"]
-    );
 }
 
 #[test]
