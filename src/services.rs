@@ -395,12 +395,15 @@ pub fn transcribe(samples: &[f32], configured_model_path: Option<&str>) -> io::R
     let segments = state.full_n_segments();
     for idx in 0..segments {
         let segment = state
-            .full_get_segment_text(idx)
-            .map_err(|err| io::Error::other(format!("failed reading whisper segment: {err}")))?;
+            .get_segment(idx)
+            .ok_or_else(|| io::Error::other(format!("missing whisper segment at index {idx}")))?;
+        let segment_text = segment
+            .to_str()
+            .map_err(|err| io::Error::other(format!("invalid utf-8 in whisper segment: {err}")))?;
         if !text.is_empty() {
             text.push(' ');
         }
-        text.push_str(segment.trim());
+        text.push_str(segment_text.trim());
     }
 
     Ok(text.trim().to_string())

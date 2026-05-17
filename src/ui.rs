@@ -343,7 +343,7 @@ pub fn build_settings_window(
             let default_id = default.to_string_lossy().to_string();
             model_combo.set_active_id(Some(&default_id));
             if model_combo.active_id().is_none() {
-                model_combo.set_active(0);
+                model_combo.set_active(Some(0));
             }
         }
     }
