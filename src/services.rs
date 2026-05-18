@@ -1,23 +1,38 @@
 use crate::config::{AppConfig, OutputMode};
 use gtk::gdk;
 use gtk::prelude::DisplayExt;
+use psimple::Simple;
+use pulse::callbacks::ListResult;
+use pulse::context::{Context, FlagSet as ContextFlagSet, State};
+use pulse::def::BufferAttr;
+use pulse::mainloop::standard::Mainloop;
+use pulse::sample::{Format, Spec};
+use pulse::stream::Direction;
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+#[cfg(test)]
+use std::fs::{File, OpenOptions};
+#[cfg(test)]
+use std::io::Write;
+#[cfg(test)]
+use std::os::unix::fs::OpenOptionsExt;
+
 const SAMPLE_RATE: u32 = 16_000;
 const BYTES_PER_SAMPLE: u64 = 2;
+const RECORDING_LATENCY_MILLIS: u32 = 30;
 const MIN_RECORDING_DURATION: Duration = Duration::from_millis(300);
 const MIN_SPEECH_DURATION: Duration = Duration::from_millis(200);
 const SPEECH_RMS_THRESHOLD: f32 = 0.015;
@@ -106,54 +121,61 @@ pub fn hotkey_matches(candidate: Hotkey, key: gdk::Key, mods: gdk::ModifierType)
 }
 
 pub fn list_audio_sources() -> Vec<String> {
-    let output = Command::new("pactl")
-        .args(["list", "short", "sources"])
-        .output();
+    with_pulse_context(|context, mainloop| {
+        let introspector = context.introspect();
+        let done = Arc::new(AtomicBool::new(false));
+        let sources = Arc::new(Mutex::new(Vec::new()));
+        let done_callback = Arc::clone(&done);
+        let sources_callback = Arc::clone(&sources);
+        let operation = introspector.get_source_info_list(move |result| match result {
+            ListResult::Item(info) => {
+                if let Some(name) = info.name.as_deref() {
+                    sources_callback.lock().unwrap().push(name.to_string());
+                }
+            }
+            ListResult::End => done_callback.store(true, Ordering::Release),
+            ListResult::Error => {
+                done_callback.store(true, Ordering::Release);
+            }
+        });
 
-    let Ok(output) = output else {
-        return vec![];
-    };
+        wait_for_pulse_completion(mainloop, &done);
+        drop(operation);
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .filter_map(|line| line.split('\t').nth(1))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+        let sources = sources.lock().unwrap().clone();
+        Ok(sources)
+    })
+    .unwrap_or_default()
 }
 
 pub fn default_audio_source() -> Option<String> {
-    let output = Command::new("pactl")
-        .arg("get-default-source")
-        .output()
-        .ok()?;
-    let source = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!source.is_empty()).then_some(source)
-}
+    with_pulse_context(|context, mainloop| {
+        let introspector = context.introspect();
+        let done = Arc::new(AtomicBool::new(false));
+        let default_source = Arc::new(Mutex::new(None::<String>));
+        let done_callback = Arc::clone(&done);
+        let default_source_callback = Arc::clone(&default_source);
+        let operation = introspector.get_server_info(move |info| {
+            let source = info
+                .default_source_name
+                .as_deref()
+                .map(|name| name.to_string());
+            *default_source_callback.lock().unwrap() = source;
+            done_callback.store(true, Ordering::Release);
+        });
 
-pub fn build_recording_command(config: &AppConfig) -> Command {
-    let mut command = Command::new("parec");
-    command.args([
-        "--client-name=whisper-gtk",
-        "--format=s16le",
-        "--channels=1",
-        "--rate=16000",
-        "--latency-msec=30",
-    ]);
-    if let Some(source) = config.audio_source.as_ref() {
-        command.args(["-d", source]);
-    } else if let Some(source) = default_audio_source() {
-        command.args(["-d", &source]);
-    }
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::null());
-    command
+        wait_for_pulse_completion(mainloop, &done);
+        drop(operation);
+
+        let default_source = default_source.lock().unwrap().clone();
+        Ok(default_source)
+    })
+    .unwrap_or(None)
 }
 
 pub struct RecordingSession {
-    child: Child,
-    raw_path: PathBuf,
-    raw_thread: thread::JoinHandle<io::Result<AudioStats>>,
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<io::Result<CapturedRecording>>,
     level_rx: Receiver<f32>,
     started_at: Instant,
 }
@@ -165,51 +187,34 @@ pub enum RecordingStop {
 
 impl RecordingSession {
     pub fn start(config: &AppConfig) -> io::Result<Self> {
-        let (raw_file, raw_path) = create_private_temp_file("whisper-gtk-recording.raw")?;
-        let mut command = build_recording_command(config);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                let _ = fs::remove_file(&raw_path);
-                return Err(err);
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = fs::remove_file(&raw_path);
-                return Err(io::Error::other("parec stdout unavailable"));
-            }
-        };
+        let spec = recording_sample_spec();
+        let selected_device = config.audio_source.clone();
         let (level_tx, level_rx) = std::sync::mpsc::channel();
-        let raw_thread =
-            thread::spawn(move || copy_stdout_to_file_with_levels(stdout, raw_file, level_tx));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            capture_recording_worker(spec, selected_device, worker_stop, level_tx)
+        });
         Ok(Self {
-            child,
-            raw_path,
-            raw_thread,
+            stop,
+            worker,
             level_rx,
             started_at: Instant::now(),
         })
     }
 
-    pub fn stop(mut self) -> io::Result<RecordingStop> {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let stats = self
-            .raw_thread
+    pub fn stop(self) -> io::Result<RecordingStop> {
+        self.stop.store(true, Ordering::Release);
+        let captured = self
+            .worker
             .join()
-            .map_err(|_| io::Error::other("recording writer thread panicked"))??;
+            .map_err(|_| io::Error::other("recording worker thread panicked"))??;
+        let stats = captured.stats;
         if !stats.should_transcribe() {
-            let _ = fs::remove_file(&self.raw_path);
             return Ok(RecordingStop::Discarded(stats));
         }
 
-        let samples = read_pcm_f32(&self.raw_path)?;
-        let _ = fs::remove_file(&self.raw_path);
-        Ok(RecordingStop::Captured(samples))
+        Ok(RecordingStop::Captured(captured.samples))
     }
 
     pub fn started_at(&self) -> Instant {
@@ -219,6 +224,12 @@ impl RecordingSession {
     pub fn try_read_level(&self) -> Option<f32> {
         self.level_rx.try_recv().ok()
     }
+}
+
+#[derive(Debug)]
+struct CapturedRecording {
+    samples: Vec<f32>,
+    stats: AudioStats,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -247,29 +258,6 @@ impl RecordingGeneration {
     }
 }
 
-fn copy_stdout_to_file_with_levels(
-    mut stdout: ChildStdout,
-    mut file: File,
-    level_tx: Sender<f32>,
-) -> io::Result<AudioStats> {
-    let mut stats = AudioStats::default();
-    let mut buffer = [0u8; 4096];
-    let mut carry = None;
-
-    loop {
-        let read = stdout.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-
-        file.write_all(&buffer[..read])?;
-        let metrics = stats.ingest_bytes(&buffer[..read], &mut carry);
-        let _ = level_tx.send(metrics.peak.clamp(0.0, 1.0));
-    }
-
-    Ok(stats)
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStats {
     bytes: u64,
@@ -278,44 +266,17 @@ pub struct AudioStats {
 
 impl AudioStats {
     pub fn ingest_bytes(&mut self, bytes: &[u8], carry: &mut Option<u8>) -> AudioChunkMetrics {
-        let mut peak = 0f32;
-        let mut square_sum = 0f64;
-        let mut samples = 0u64;
-        let mut slice = bytes;
+        let (metrics, sample_count) = decode_pcm_s16le_chunk(bytes, carry, |_| {});
+        self.ingest_sample_count(sample_count, metrics.rms);
+        metrics
+    }
 
-        if let (Some(previous), Some(current)) = (carry.take(), slice.first().copied()) {
-            let sample = i16::from_le_bytes([previous, current]);
-            let normalized = sample as f32 / i16::MAX as f32;
-            peak = peak.max(normalized.abs());
-            square_sum += (normalized as f64).powi(2);
-            samples += 1;
-            slice = &slice[1..];
-        }
-
-        for chunk in slice.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-            let normalized = sample as f32 / i16::MAX as f32;
-            peak = peak.max(normalized.abs());
-            square_sum += (normalized as f64).powi(2);
-            samples += 1;
-        }
-
-        if let Some(last) = slice.chunks_exact(2).remainder().first().copied() {
-            *carry = Some(last);
-        }
-
-        let sample_bytes = samples * BYTES_PER_SAMPLE;
+    fn ingest_sample_count(&mut self, sample_count: u64, rms: f32) {
+        let sample_bytes = sample_count * BYTES_PER_SAMPLE;
         self.bytes += sample_bytes;
-        let rms = if samples == 0 {
-            0.0
-        } else {
-            (square_sum / samples as f64).sqrt() as f32
-        };
         if rms >= SPEECH_RMS_THRESHOLD {
             self.speech_bytes += sample_bytes;
         }
-
-        AudioChunkMetrics { peak, rms }
     }
 
     pub fn duration(&self) -> Duration {
@@ -335,6 +296,60 @@ impl AudioStats {
 pub struct AudioChunkMetrics {
     pub peak: f32,
     pub rms: f32,
+}
+
+pub fn append_recorded_s16le_chunk(
+    bytes: &[u8],
+    samples: &mut Vec<f32>,
+    stats: &mut AudioStats,
+    carry: &mut Option<u8>,
+) -> AudioChunkMetrics {
+    let (metrics, sample_count) = decode_pcm_s16le_chunk(bytes, carry, |sample| {
+        samples.push(sample);
+    });
+    stats.ingest_sample_count(sample_count, metrics.rms);
+    metrics
+}
+
+fn decode_pcm_s16le_chunk(
+    bytes: &[u8],
+    carry: &mut Option<u8>,
+    mut push_sample: impl FnMut(f32),
+) -> (AudioChunkMetrics, u64) {
+    let mut peak = 0f32;
+    let mut square_sum = 0f64;
+    let mut samples = 0u64;
+    let mut slice = bytes;
+
+    if let (Some(previous), Some(current)) = (carry.take(), slice.first().copied()) {
+        let sample = i16::from_le_bytes([previous, current]);
+        let normalized = sample as f32 / i16::MAX as f32;
+        peak = peak.max(normalized.abs());
+        square_sum += (normalized as f64).powi(2);
+        samples += 1;
+        push_sample(normalized);
+        slice = &slice[1..];
+    }
+
+    for chunk in slice.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let normalized = sample as f32 / i16::MAX as f32;
+        peak = peak.max(normalized.abs());
+        square_sum += (normalized as f64).powi(2);
+        samples += 1;
+        push_sample(normalized);
+    }
+
+    if let Some(last) = slice.chunks_exact(2).remainder().first().copied() {
+        *carry = Some(last);
+    }
+
+    let rms = if samples == 0 {
+        0.0
+    } else {
+        (square_sum / samples as f64).sqrt() as f32
+    };
+    (AudioChunkMetrics { peak, rms }, samples)
 }
 
 fn duration_for_bytes(bytes: u64) -> Duration {
@@ -374,16 +389,6 @@ fn write_wav_header(writer: &mut File, data_len: u32) -> io::Result<()> {
     writer.write_all(b"data")?;
     writer.write_all(&data_len.to_le_bytes())?;
     Ok(())
-}
-
-fn read_pcm_f32(path: &std::path::Path) -> io::Result<Vec<f32>> {
-    let bytes = fs::read(path)?;
-    let mut samples = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        samples.push(sample as f32 / i16::MAX as f32);
-    }
-    Ok(samples)
 }
 
 fn whisper_model_path(configured: Option<&str>) -> PathBuf {
@@ -505,34 +510,97 @@ pub fn run_output_mode(mode: OutputMode, text: &str) -> io::Result<()> {
     }
 }
 
-pub fn temp_path(name: &str) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let stamp = format!("{}-{}", std::process::id(), stamp);
-    std::env::temp_dir().join(format!("{stamp}-{name}"))
+fn recording_sample_spec() -> Spec {
+    let spec = Spec {
+        format: Format::S16le,
+        channels: 1,
+        rate: SAMPLE_RATE,
+    };
+    assert!(spec.is_valid(), "invalid PulseAudio sample spec");
+    spec
 }
 
-fn create_private_temp_file(name: &str) -> io::Result<(File, PathBuf)> {
-    for attempt in 0..100u32 {
-        let path = temp_path(&format!("{attempt}-{name}"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => return Ok((file, path)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        }
+fn recording_chunk_bytes() -> usize {
+    ((SAMPLE_RATE as usize * RECORDING_LATENCY_MILLIS as usize) / 1000) * 2
+}
+
+fn recording_buffer_attr() -> BufferAttr {
+    BufferAttr {
+        maxlength: u32::MAX,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: recording_chunk_bytes() as u32,
+    }
+}
+
+fn capture_recording_worker(
+    spec: Spec,
+    selected_device: Option<String>,
+    stop: Arc<AtomicBool>,
+    level_tx: Sender<f32>,
+) -> io::Result<CapturedRecording> {
+    let buffer_attr = recording_buffer_attr();
+    let simple = Simple::new(
+        None,
+        "whisper-gtk",
+        Direction::Record,
+        selected_device.as_deref(),
+        "whisper-gtk",
+        &spec,
+        None,
+        Some(&buffer_attr),
+    )
+    .map_err(|err| io::Error::other(format!("failed to open PulseAudio capture stream: {err}")))?;
+
+    let mut samples = Vec::new();
+    let mut stats = AudioStats::default();
+    let mut carry = None;
+    let mut buffer = vec![0u8; recording_chunk_bytes()];
+
+    while !stop.load(Ordering::Acquire) {
+        simple
+            .read(&mut buffer)
+            .map_err(|err| io::Error::other(format!("PulseAudio capture failed: {err}")))?;
+        let metrics = append_recorded_s16le_chunk(&buffer, &mut samples, &mut stats, &mut carry);
+        let _ = level_tx.send(metrics.peak.clamp(0.0, 1.0));
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "unable to create private temporary recording file",
-    ))
+    Ok(CapturedRecording { samples, stats })
+}
+
+fn with_pulse_context<T>(
+    f: impl FnOnce(&mut Context, &mut Mainloop) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut mainloop =
+        Mainloop::new().ok_or_else(|| io::Error::other("failed to create PulseAudio mainloop"))?;
+    let mut context = Context::new(&mainloop, "whisper-gtk")
+        .ok_or_else(|| io::Error::other("failed to create PulseAudio context"))?;
+    context
+        .connect(None, ContextFlagSet::NOFLAGS, None)
+        .map_err(|err| io::Error::other(format!("failed to connect to PulseAudio: {err}")))?;
+
+    while !matches!(
+        context.get_state(),
+        State::Ready | State::Failed | State::Terminated
+    ) {
+        let _ = mainloop.iterate(true);
+    }
+
+    if !matches!(context.get_state(), State::Ready) {
+        return Err(io::Error::other(format!(
+            "PulseAudio context initialization failed: {:?}",
+            context.get_state()
+        )));
+    }
+
+    f(&mut context, &mut mainloop)
+}
+
+fn wait_for_pulse_completion(mainloop: &mut Mainloop, done: &Arc<AtomicBool>) {
+    while !done.load(Ordering::Acquire) {
+        let _ = mainloop.iterate(true);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

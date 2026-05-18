@@ -1,6 +1,6 @@
 use crate::config::{physical_core_count_from_cpuinfo, AppConfig, OutputMode};
 use crate::services::{
-    build_recording_command, hotkey_matches, keycode_is_down, list_whisper_models_in,
+    append_recorded_s16le_chunk, hotkey_matches, keycode_is_down, list_whisper_models_in,
     overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats, Hotkey,
     MonitorGeometry, RecordingGeneration,
 };
@@ -8,13 +8,6 @@ use crate::ui::{audio_source_selection_to_config, output_mode_selection_to_confi
 use gtk::gdk;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-fn command_args(command: &std::process::Command) -> Vec<String> {
-    command
-        .get_args()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect()
-}
 
 #[test]
 fn config_roundtrip() {
@@ -199,26 +192,21 @@ fn audio_gate_allows_sustained_speech() {
 }
 
 #[test]
-fn recording_command_uses_configured_source() {
-    let cfg = AppConfig {
-        audio_source: Some("alsa_input.usb".to_string()),
-        whisper_threads: 8,
-        ..AppConfig::default()
-    };
-    let command = build_recording_command(&cfg);
-    assert_eq!(command.get_program().to_string_lossy(), "parec");
-    assert_eq!(
-        command_args(&command),
-        vec![
-            "--client-name=whisper-gtk",
-            "--format=s16le",
-            "--channels=1",
-            "--rate=16000",
-            "--latency-msec=30",
-            "-d",
-            "alsa_input.usb",
-        ]
-    );
+fn recorded_chunks_append_expected_samples_and_update_stats() {
+    let mut samples = Vec::new();
+    let mut stats = AudioStats::default();
+    let mut carry = None;
+    let bytes = pcm_i16_samples(&[0, i16::MAX / 2, -(i16::MAX / 2)]);
+
+    let metrics = append_recorded_s16le_chunk(&bytes, &mut samples, &mut stats, &mut carry);
+
+    assert_eq!(samples.len(), 3);
+    assert!((samples[0] - 0.0).abs() < 1e-6);
+    assert!((samples[1] - 0.5).abs() < 0.001);
+    assert!((samples[2] + 0.5).abs() < 0.001);
+    assert!(metrics.peak > 0.49 && metrics.peak < 0.51);
+    assert!(stats.duration().as_micros() > 0);
+    assert_eq!(stats.duration(), stats.speech_duration());
 }
 
 #[test]
@@ -273,6 +261,14 @@ fn pcm_samples(amplitude: f32, samples: usize) -> Vec<u8> {
     let sample = (amplitude.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
     let mut bytes = Vec::with_capacity(samples * 2);
     for _ in 0..samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn pcm_i16_samples(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes

@@ -4,6 +4,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::services::default_audio_source as query_default_audio_source;
+
 const DEFAULT_MAX_RECORDING_SECS: u32 = 30;
 const MIN_MAX_RECORDING_SECS: u32 = 5;
 const MAX_MAX_RECORDING_SECS: u32 = 180;
@@ -70,7 +72,11 @@ fn default_hotkey() -> String {
 }
 
 fn default_audio_source() -> Option<String> {
-    None
+    if cfg!(test) {
+        None
+    } else {
+        query_default_audio_source()
+    }
 }
 
 fn default_output_mode() -> OutputMode {
