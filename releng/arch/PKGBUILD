@@ -6,35 +6,36 @@ pkgdesc="GTK4 push-to-talk desktop dictation using whisper.cpp"
 arch=('x86_64')
 url="https://github.com/tyzoid/whisper-gtk"
 license=('GPL-3.0-only')
-depends=('gtk4' 'glibc' 'libgcc' 'libx11' 'libxrandr' 'libpulse' 'xdotool' 'whisper.cpp')
-makedepends=('cargo')
+depends=('gtk4' 'glibc' 'libgcc' 'libx11' 'libxrandr' 'libpulse' 'xdotool')
+makedepends=('cargo' 'git')
 options=('!lto')
-source=()
-sha256sums=()
-_repo_root="$startdir/../.."
+source=("git+$url.git")
+sha256sums=('SKIP')
 
 prepare() {
-  cd "$_repo_root"
+  cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
-  cd "$_repo_root"
+  cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  export GGML_NATIVE=ON
   cargo build --frozen --release
 }
 
 check() {
-  cd "$_repo_root"
+  cd "$srcdir/$pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  export GGML_NATIVE=ON
   cargo test --frozen
 }
 
 package() {
-  cd "$_repo_root"
+  cd "$srcdir/$pkgname"
   install -Dm755 "target/release/whisper-gtk" "$pkgdir/usr/bin/whisper-gtk"
   install -Dm644 "dist/whisper-gtk.desktop" "$pkgdir/usr/share/applications/whisper-gtk.desktop"
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
