@@ -217,6 +217,7 @@ fn install_settings_css() {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_model_selection(
     config: Arc<Mutex<AppConfig>>,
     parent: gtk::glib::SendWeakRef<ApplicationWindow>,
@@ -269,7 +270,7 @@ fn validate_model_selection(
 impl Default for WaveformState {
     fn default() -> Self {
         Self {
-            levels: std::iter::repeat(0.0).take(OVERLAY_BAR_COUNT).collect(),
+            levels: VecDeque::from(vec![0.0; OVERLAY_BAR_COUNT]),
             level: 0.0,
         }
     }

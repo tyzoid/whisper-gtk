@@ -9,7 +9,7 @@ Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation.
 ## Features
 
 - Hold-to-record global hotkey on X11
-- PulseAudio capture through `parec`
+- PulseAudio capture through native `libpulse` / `libpulse-simple`
 - Small bottom-screen recording overlay with microphone icon and live waveform
 - Silence/short-recording gate to avoid transcribing blank audio
 - Transcription through `whisper.cpp-base.en`
@@ -34,7 +34,7 @@ Runtime:
 
 - Linux with an X11 session or XWayland-compatible setup
 - GTK4
-- PulseAudio-compatible audio server with `parec`
+- PulseAudio-compatible audio server
 - `xdotool`
 - `whisper.cpp-base.en` available on `PATH`
 
