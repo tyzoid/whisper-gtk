@@ -26,7 +26,7 @@ Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation.
 
 ### Settings
 
-![Whisper GTK settings dialog](screenshots/settings.png)
+![Whisper GTK settings dialog (updated settings menu)](screenshots/settings.png)
 
 ## Requirements
 
