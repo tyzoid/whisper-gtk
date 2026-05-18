@@ -10,9 +10,9 @@ mod ui;
 use crate::config::AppConfig;
 use crate::native::TrayIndicator;
 use crate::services::{
-    focused_monitor_geometry, overlay_position_for_monitor, preload_whisper_state, run_output_mode,
-    spawn_xev_hotkey_listener, transcribe, transcribe_with_state, RecordingGeneration,
-    RecordingSession, RecordingStop,
+    focused_monitor_geometry, overlay_position_for_monitor, preload_whisper_state,
+    raise_and_move_window_by_title, run_output_mode, spawn_xev_hotkey_listener, transcribe,
+    transcribe_with_state, RecordingGeneration, RecordingSession, RecordingStop,
 };
 use crate::ui::{build_overlay, build_settings_window, OverlayMeter};
 use gtk::prelude::*;
@@ -329,17 +329,7 @@ fn position_overlay_window(window: &ApplicationWindow) {
     };
     let (x, y) = overlay_position_for_monitor(monitor, 200, 40);
     let title = window.title().unwrap_or_else(|| "Whisper Recording".into());
-    let _ = std::process::Command::new("xdotool")
-        .args([
-            "search",
-            "--name",
-            &title,
-            "windowraise",
-            "windowmove",
-            &x.to_string(),
-            &y.to_string(),
-        ])
-        .output();
+    let _ = raise_and_move_window_by_title(&title, x, y);
 }
 
 fn main() {

@@ -17,6 +17,7 @@ exclude = [
 [dependencies]
 gtk = { package = "gtk4", version = "0.10.3" }
 glib = "0.21.5"
+libxdo = "0.6"
 pulse = { version = "2.0", package = "libpulse-binding" }
 psimple = { version = "2.0", package = "libpulse-simple-binding" }
 serde = { version = "1.0.228", features = ["derive"] }

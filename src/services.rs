@@ -1,6 +1,7 @@
 use crate::config::{AppConfig, OutputMode};
 use gtk::gdk;
 use gtk::prelude::DisplayExt;
+use libxdo::XDo;
 use psimple::Simple;
 use pulse::callbacks::ListResult;
 use pulse::context::{Context, FlagSet as ContextFlagSet, State};
@@ -13,7 +14,6 @@ use std::fs;
 use std::io;
 use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -478,14 +478,11 @@ pub fn transcribe_with_state(
 }
 
 pub fn type_text(text: &str) -> io::Result<()> {
-    let status = Command::new("xdotool")
-        .args(["type", "--clearmodifiers", "--delay", "0", text])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("xdotool type failed"))
-    }
+    with_xdo(|xdo| {
+        xdo.enter_text(text, 0)
+            .map_err(|err| io::Error::other(format!("libxdo text injection failed: {err:?}")))
+    })
+    .or_else(|_| paste_text_from_clipboard(text))
 }
 
 pub fn paste_text_from_clipboard(text: &str) -> io::Result<()> {
@@ -493,14 +490,48 @@ pub fn paste_text_from_clipboard(text: &str) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no GTK display available for clipboard"))?;
     display.clipboard().set_text(text);
     display.primary_clipboard().set_text(text);
-    let status = Command::new("xdotool")
-        .args(["key", "--clearmodifiers", "ctrl+v"])
-        .status()?;
-    if status.success() {
+
+    with_xdo(|xdo| {
+        xdo.send_keysequence("ctrl+v", 0)
+            .map_err(|err| io::Error::other(format!("libxdo keysequence failed: {err:?}")))
+    })
+}
+
+pub fn raise_and_move_window_by_title(title: &str, x: i32, y: i32) -> io::Result<()> {
+    with_x11_display(|display| unsafe {
+        let root = XDefaultRootWindow(display);
+        let window = find_window_by_title(display, root, title)
+            .ok_or_else(|| io::Error::other("failed to locate X11 window by title"))?;
+        let _ = XRaiseWindow(display, window);
+        let _ = XMoveWindow(display, window, x, y);
+        x11_sync(display);
         Ok(())
-    } else {
-        Err(io::Error::other("xdotool paste failed"))
+    })
+}
+
+fn with_x11_display<T>(f: impl FnOnce(*mut XDisplay) -> io::Result<T>) -> io::Result<T> {
+    unsafe {
+        let display = XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return Err(io::Error::other("failed to open X11 display"));
+        }
+
+        let result = f(display);
+        let _ = XCloseDisplay(display);
+        result
     }
+}
+
+fn x11_sync(display: *mut XDisplay) {
+    unsafe {
+        let _ = XSync(display, 0);
+    }
+}
+
+fn with_xdo<T>(f: impl FnOnce(&XDo) -> io::Result<T>) -> io::Result<T> {
+    let xdo = XDo::new(None)
+        .map_err(|err| io::Error::other(format!("failed to create libxdo context: {err:?}")))?;
+    f(&xdo)
 }
 
 pub fn run_output_mode(mode: OutputMode, text: &str) -> io::Result<()> {
@@ -508,6 +539,59 @@ pub fn run_output_mode(mode: OutputMode, text: &str) -> io::Result<()> {
         OutputMode::DirectTyping => type_text(text),
         OutputMode::ClipboardPaste => paste_text_from_clipboard(text),
     }
+}
+
+unsafe fn find_window_by_title(
+    display: *mut XDisplay,
+    window: c_ulong,
+    title: &str,
+) -> Option<c_ulong> {
+    if window_title(display, window).as_deref() == Some(title) {
+        return Some(window);
+    }
+
+    let mut root_return = 0;
+    let mut parent_return = 0;
+    let mut children_return: *mut c_ulong = std::ptr::null_mut();
+    let mut child_count = 0u32;
+    if XQueryTree(
+        display,
+        window,
+        &mut root_return,
+        &mut parent_return,
+        &mut children_return,
+        &mut child_count,
+    ) == 0
+    {
+        return None;
+    }
+
+    let mut found = None;
+    if !children_return.is_null() {
+        for idx in 0..child_count as usize {
+            let child = *children_return.add(idx);
+            found = find_window_by_title(display, child, title);
+            if found.is_some() {
+                break;
+            }
+        }
+        let _ = XFree(children_return as *mut c_void);
+    }
+
+    found
+}
+
+unsafe fn window_title(display: *mut XDisplay, window: c_ulong) -> Option<String> {
+    let mut window_name: *mut c_char = std::ptr::null_mut();
+    if XFetchName(display, window, &mut window_name) == 0 || window_name.is_null() {
+        return None;
+    }
+    let title = std::ffi::CStr::from_ptr(window_name)
+        .to_str()
+        .ok()
+        .map(|title| title.to_string());
+    let _ = XFree(window_name as *mut c_void);
+    title
 }
 
 fn recording_sample_spec() -> Spec {
@@ -937,6 +1021,19 @@ extern "C" {
     fn XStringToKeysym(string: *const c_char) -> c_ulong;
     fn XKeysymToKeycode(display: *mut XDisplay, keysym: c_ulong) -> u8;
     fn XQueryKeymap(display: *mut XDisplay, keys_return: *mut c_char) -> c_int;
+    fn XQueryTree(
+        display: *mut XDisplay,
+        window: c_ulong,
+        root_return: *mut c_ulong,
+        parent_return: *mut c_ulong,
+        children_return: *mut *mut c_ulong,
+        nchildren_return: *mut c_uint,
+    ) -> c_int;
+    fn XFetchName(
+        display: *mut XDisplay,
+        window: c_ulong,
+        window_name_return: *mut *mut c_char,
+    ) -> c_int;
     fn XGrabKey(
         display: *mut XDisplay,
         keycode: c_int,
@@ -953,6 +1050,8 @@ extern "C" {
         grab_window: c_ulong,
     ) -> c_int;
     fn XSync(display: *mut XDisplay, discard: c_int) -> c_int;
+    fn XMoveWindow(display: *mut XDisplay, window: c_ulong, x: c_int, y: c_int) -> c_int;
+    fn XRaiseWindow(display: *mut XDisplay, window: c_ulong) -> c_int;
     fn XDisplayWidth(display: *mut XDisplay, screen_number: c_int) -> c_int;
     fn XDisplayHeight(display: *mut XDisplay, screen_number: c_int) -> c_int;
 }
