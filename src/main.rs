@@ -11,7 +11,8 @@ use crate::config::AppConfig;
 use crate::native::TrayIndicator;
 use crate::services::{
     focused_monitor_geometry, overlay_position_for_monitor, preload_whisper_state,
-    raise_and_move_window_by_title, run_output_mode, spawn_xev_hotkey_listener, transcribe,
+    raise_and_move_window_by_title, run_output_mode,
+    run_whisper_model_validation_helper_if_requested, spawn_xev_hotkey_listener, transcribe,
     transcribe_with_state, RecordingGeneration, RecordingSession, RecordingStop,
 };
 use crate::ui::{build_overlay, build_settings_window, prepare_overlay_window, OverlayMeter};
@@ -334,6 +335,10 @@ fn move_overlay_window_to(window: &ApplicationWindow, x: i32, y: i32) {
 }
 
 fn main() {
+    if run_whisper_model_validation_helper_if_requested() {
+        return;
+    }
+
     let app = Application::builder()
         .application_id("dev.whisper.gtk")
         .build();

@@ -1,8 +1,8 @@
 use crate::config::{physical_core_count_from_cpuinfo, AppConfig, OutputMode};
 use crate::services::{
-    append_recorded_s16le_chunk, hotkey_matches, keycode_is_down, list_whisper_models_in,
-    overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats, Hotkey,
-    MonitorGeometry, RecordingGeneration,
+    append_recorded_s16le_chunk, hotkey_matches, keycode_is_down, list_whisper_models_from_roots,
+    list_whisper_models_in, overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats,
+    Hotkey, MonitorGeometry, RecordingGeneration,
 };
 use crate::ui::{audio_source_selection_to_config, output_mode_selection_to_config, WaveformState};
 use gtk::gdk;
@@ -251,6 +251,32 @@ fn whisper_model_scanner_matches_packaged_layout() {
     let expected = vec![
         model_dir_a.join("ggml-base.en.bin"),
         model_dir_b.join("ggml-large-v3-q5_0.bin"),
+    ];
+    assert_eq!(models, expected);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn whisper_model_scanner_includes_cache_layout() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("whisper-gtk-model-cache-scan-{stamp}"));
+    let share = root.join("usr/share");
+    let cache = root.join("cache/whisper");
+    let model_dir = share.join("whisper.cpp-model-tiny.en");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(model_dir.join("ggml-tiny.en.bin"), b"a").unwrap();
+    fs::write(cache.join("ggml-cache.bin"), b"b").unwrap();
+    fs::write(cache.join("not-a-model.txt"), b"c").unwrap();
+
+    let models = list_whisper_models_from_roots(&share, &cache);
+    let expected = vec![
+        cache.join("ggml-cache.bin"),
+        model_dir.join("ggml-tiny.en.bin"),
     ];
     assert_eq!(models, expected);
 

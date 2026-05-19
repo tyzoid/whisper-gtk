@@ -14,6 +14,7 @@ use std::fs;
 use std::io;
 use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -53,7 +54,10 @@ pub fn default_whisper_model_path() -> PathBuf {
 }
 
 pub fn list_whisper_models() -> Vec<PathBuf> {
-    list_whisper_models_in(Path::new("/usr/share"))
+    list_whisper_models_from_roots(
+        Path::new("/usr/share"),
+        &glib::user_cache_dir().join("whisper"),
+    )
 }
 
 pub fn list_whisper_models_in(share_root: &Path) -> Vec<PathBuf> {
@@ -69,23 +73,37 @@ pub fn list_whisper_models_in(share_root: &Path) -> Vec<PathBuf> {
         if !model_dir.is_dir() || !dir_name.starts_with(WHISPER_MODEL_PREFIX) {
             continue;
         }
-        let Ok(files) = fs::read_dir(&model_dir) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if path.is_file()
-                && file_name.starts_with(WHISPER_MODEL_FILE_PREFIX)
-                && file_name.ends_with(WHISPER_MODEL_FILE_SUFFIX)
-            {
-                models.push(path);
-            }
-        }
+        models.extend(list_whisper_model_files_in_dir(&model_dir));
     }
     models.sort();
+    models
+}
+
+pub fn list_whisper_models_from_roots(share_root: &Path, cache_root: &Path) -> Vec<PathBuf> {
+    let mut models = list_whisper_models_in(share_root);
+    models.extend(list_whisper_model_files_in_dir(cache_root));
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn list_whisper_model_files_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut models = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_file()
+            && file_name.starts_with(WHISPER_MODEL_FILE_PREFIX)
+            && file_name.ends_with(WHISPER_MODEL_FILE_SUFFIX)
+        {
+            models.push(path);
+        }
+    }
     models
 }
 
@@ -432,6 +450,52 @@ pub fn validate_whisper_model_path(model_path: &Path) -> io::Result<()> {
     ctx.create_state()
         .map_err(|err| io::Error::other(format!("failed to create whisper state: {err}")))?;
     Ok(())
+}
+
+pub fn run_whisper_model_validation_helper_if_requested() -> bool {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    let Some(flag) = args.next() else {
+        return false;
+    };
+    if flag != "--validate-whisper-model" {
+        return false;
+    }
+    let Some(model_path) = args.next() else {
+        std::process::exit(2);
+    };
+    if args.next().is_some() {
+        std::process::exit(2);
+    }
+    match validate_whisper_model_path(Path::new(&model_path)) {
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn validate_whisper_model_path_in_subprocess(model_path: &Path) -> io::Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|err| io::Error::other(format!("failed to resolve current executable: {err}")))?;
+    let status = Command::new(exe)
+        .arg("--validate-whisper-model")
+        .arg(model_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| {
+            io::Error::other(format!("failed to spawn model validation helper: {err}"))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "model validation helper exited with status {status}"
+        )))
+    }
 }
 
 pub fn transcribe(

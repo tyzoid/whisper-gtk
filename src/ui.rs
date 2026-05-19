@@ -1,7 +1,7 @@
 use crate::config::{AppConfig, OutputMode};
 use crate::services::{
     default_whisper_model_path, list_audio_sources, list_whisper_models,
-    validate_whisper_model_path, Hotkey,
+    validate_whisper_model_path_in_subprocess, Hotkey,
 };
 use glib::object::ObjectType as _;
 use gtk::gdk;
@@ -15,7 +15,7 @@ use gtk::{
     StringList, StringObject, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f64::consts::TAU;
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_long, c_uchar, c_ulong};
@@ -270,6 +270,89 @@ fn ellipsized_dropdown(model: &StringList, ellipsize: EllipsizeMode) -> DropDown
     dropdown
 }
 
+fn model_dropdown_with_validation(
+    model: &StringList,
+    ellipsize: EllipsizeMode,
+    invalid_models: Arc<Mutex<HashMap<String, bool>>>,
+    warning_icons: Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+) -> DropDown {
+    let factory = SignalListItemFactory::new();
+    let invalid_models_for_bind = invalid_models.clone();
+    let warning_icons_for_bind = warning_icons.clone();
+    factory.connect_setup(move |_, item| {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        let label = Label::new(None);
+        label.set_hexpand(true);
+        label.set_xalign(0.0);
+        label.set_ellipsize(ellipsize);
+
+        let warning_icon = Image::from_icon_name("dialog-warning-symbolic");
+        warning_icon.set_pixel_size(16);
+        warning_icon.set_visible(false);
+
+        row.append(&label);
+        row.append(&warning_icon);
+
+        let list_item = item
+            .downcast_ref::<gtk::ListItem>()
+            .expect("drop-down setup item must be a GtkListItem");
+        list_item.set_child(Some(&row));
+    });
+    factory.connect_bind(move |_, item| {
+        let list_item = item
+            .downcast_ref::<gtk::ListItem>()
+            .expect("drop-down bind item must be a GtkListItem");
+        let row = list_item
+            .child()
+            .and_then(|child| child.downcast::<GtkBox>().ok())
+            .expect("drop-down list item child must be a GtkBox");
+        let label = row
+            .first_child()
+            .and_then(|child| child.downcast::<Label>().ok())
+            .expect("drop-down list item label child must be a GtkLabel");
+        let warning_icon = label
+            .next_sibling()
+            .and_then(|child| child.downcast::<Image>().ok())
+            .expect("drop-down list item warning child must be a GtkImage");
+        let text = list_item
+            .item()
+            .and_then(|obj| obj.downcast::<StringObject>().ok())
+            .map(|obj| obj.string())
+            .unwrap_or_default();
+        let text = text.to_string();
+
+        label.set_label(&text);
+        let is_invalid = invalid_models_for_bind
+            .lock()
+            .unwrap()
+            .get(&text)
+            .copied()
+            .unwrap_or(false);
+        warning_icon.set_visible(is_invalid);
+
+        let mut warning_icons = warning_icons_for_bind.lock().unwrap();
+        for icons in warning_icons.values_mut() {
+            icons.retain(|weak_icon| {
+                if let Some(icon) = weak_icon.upgrade() {
+                    icon.as_ptr() != warning_icon.as_ptr()
+                } else {
+                    false
+                }
+            });
+        }
+        warning_icons
+            .entry(text)
+            .or_default()
+            .push(warning_icon.downgrade().into());
+    });
+
+    let dropdown = DropDown::new(Some(model.clone()), None::<&gtk::Expression>);
+    dropdown.set_factory(Some(&factory));
+    dropdown.set_list_factory(Some(&factory));
+    dropdown.set_hexpand(true);
+    dropdown
+}
+
 fn dropdown_index_for_value(model: &StringList, value: &str) -> Option<u32> {
     (0..model.n_items()).find(|&index| model.string(index).as_deref() == Some(value))
 }
@@ -401,6 +484,54 @@ fn install_settings_css() {
     );
 }
 
+fn refresh_model_warning_icons(
+    model_path: &str,
+    is_invalid: bool,
+    invalid_models: &Arc<Mutex<HashMap<String, bool>>>,
+    warning_icons: &Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+) {
+    invalid_models
+        .lock()
+        .unwrap()
+        .insert(model_path.to_string(), is_invalid);
+
+    let mut warning_icons = warning_icons.lock().unwrap();
+    if let Some(icons) = warning_icons.get_mut(model_path) {
+        icons.retain(|weak_icon| {
+            if let Some(icon) = weak_icon.upgrade() {
+                icon.set_visible(is_invalid);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn validate_whisper_models_on_load(
+    model_paths: Vec<std::path::PathBuf>,
+    invalid_models: Arc<Mutex<HashMap<String, bool>>>,
+    warning_icons: Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+) {
+    std::thread::spawn(move || {
+        for model_path in model_paths {
+            let model_path = model_path.to_string_lossy().to_string();
+            let is_invalid =
+                validate_whisper_model_path_in_subprocess(Path::new(&model_path)).is_err();
+            let invalid_models = invalid_models.clone();
+            let warning_icons = warning_icons.clone();
+            gtk::glib::MainContext::default().invoke(move || {
+                refresh_model_warning_icons(
+                    &model_path,
+                    is_invalid,
+                    &invalid_models,
+                    &warning_icons,
+                );
+            });
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_model_selection(
     config: Arc<Mutex<AppConfig>>,
@@ -413,8 +544,8 @@ fn validate_model_selection(
     previous_path: String,
 ) {
     std::thread::spawn(move || {
-        let result =
-            validate_whisper_model_path(Path::new(&model_path)).map_err(|err| err.to_string());
+        let result = validate_whisper_model_path_in_subprocess(Path::new(&model_path))
+            .map_err(|err| err.to_string());
         gtk::glib::MainContext::default().invoke(move || {
             let Some(parent) = parent.upgrade() else {
                 return;
@@ -836,7 +967,14 @@ pub fn build_settings_window(
         model_entries.append(model_path.as_ref());
     }
     model_entries.append("Other...");
-    let model_dropdown = ellipsized_dropdown(&model_entries, EllipsizeMode::Start);
+    let model_validation_state = Arc::new(Mutex::new(HashMap::new()));
+    let model_warning_icons = Arc::new(Mutex::new(HashMap::new()));
+    let model_dropdown = model_dropdown_with_validation(
+        &model_entries,
+        EllipsizeMode::Start,
+        model_validation_state.clone(),
+        model_warning_icons.clone(),
+    );
     model_dropdown.set_halign(Align::Fill);
     let model_browse_button = Button::with_label("Browse...");
     let model_selection_guard = Arc::new(Mutex::new(false));
@@ -910,6 +1048,11 @@ pub fn build_settings_window(
     threads_spin.set_value(cfg.whisper_threads.max(1) as f64);
     let current_model = default_model_selection(&model_paths, &cfg);
     let _ = dropdown_select_value(&model_dropdown, &model_entries, &current_model);
+    validate_whisper_models_on_load(
+        model_paths.clone(),
+        model_validation_state.clone(),
+        model_warning_icons.clone(),
+    );
 
     let capture_mode = std::rc::Rc::new(std::cell::RefCell::new(false));
     let capture_mode_button = capture_mode.clone();
