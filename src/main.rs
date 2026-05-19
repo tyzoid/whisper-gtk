@@ -14,7 +14,7 @@ use crate::services::{
     raise_and_move_window_by_title, run_output_mode, spawn_xev_hotkey_listener, transcribe,
     transcribe_with_state, RecordingGeneration, RecordingSession, RecordingStop,
 };
-use crate::ui::{build_overlay, build_settings_window, OverlayMeter};
+use crate::ui::{build_overlay, build_settings_window, prepare_overlay_window, OverlayMeter};
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
 use std::cell::RefCell;
@@ -101,6 +101,7 @@ impl AppController {
     fn set_recording_ui(&self, recording: bool) {
         if recording {
             self.overlay_window.show();
+            prepare_overlay_window(&self.overlay_window);
         } else {
             self.overlay_window.hide();
         }
@@ -133,14 +134,18 @@ impl AppController {
                         }
                     }));
                 let generation = self.recording_generation.next();
+                let overlay_position = focused_monitor_geometry()
+                    .map(|monitor| overlay_position_for_monitor(monitor, 200, 40));
                 self.set_recording_ui(true);
                 let window = self.overlay_window.clone();
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(40),
-                    move || {
-                        position_overlay_window(&window);
-                    },
-                );
+                if let Some((x, y)) = overlay_position {
+                    gtk::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(40),
+                        move || {
+                            move_overlay_window_to(&window, x, y);
+                        },
+                    );
+                }
                 self.start_overlay_tick_timer();
                 let max_secs = cfg.max_recording_secs;
                 if let Some(weak) = self.self_weak.clone() {
@@ -323,11 +328,7 @@ impl AppController {
     }
 }
 
-fn position_overlay_window(window: &ApplicationWindow) {
-    let Some(monitor) = focused_monitor_geometry() else {
-        return;
-    };
-    let (x, y) = overlay_position_for_monitor(monitor, 200, 40);
+fn move_overlay_window_to(window: &ApplicationWindow, x: i32, y: i32) {
     let title = window.title().unwrap_or_else(|| "Whisper Recording".into());
     let _ = raise_and_move_window_by_title(&title, x, y);
 }

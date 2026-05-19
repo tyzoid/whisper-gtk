@@ -3,7 +3,9 @@ use crate::services::{
     default_whisper_model_path, list_audio_sources, list_whisper_models,
     validate_whisper_model_path, Hotkey,
 };
+use glib::object::ObjectType as _;
 use gtk::gdk;
+use gtk::gdk::prelude::*;
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
@@ -15,11 +17,87 @@ use gtk::{
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
+use std::ffi::c_void;
+use std::os::raw::{c_int, c_long, c_uchar, c_ulong};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const OVERLAY_BAR_COUNT: usize = 11;
+
+#[repr(C)]
+struct XDisplay(c_void);
+
+#[link(name = "gtk-4")]
+extern "C" {
+    fn gdk_x11_display_get_xdisplay(display: *mut c_void) -> *mut XDisplay;
+    fn gdk_x11_surface_get_xid(surface: *mut c_void) -> c_ulong;
+    fn gdk_x11_surface_set_skip_taskbar_hint(surface: *mut c_void, skips_taskbar: c_int);
+    fn gdk_x11_surface_set_skip_pager_hint(surface: *mut c_void, skips_pager: c_int);
+}
+
+#[link(name = "X11")]
+extern "C" {
+    fn XRaiseWindow(display: *mut XDisplay, window: c_ulong) -> c_int;
+    fn XDefaultRootWindow(display: *mut XDisplay) -> c_ulong;
+    fn XInternAtom(
+        display: *mut XDisplay,
+        atom_name: *const c_uchar,
+        only_if_exists: c_int,
+    ) -> c_ulong;
+    fn XChangeProperty(
+        display: *mut XDisplay,
+        w: c_ulong,
+        property: c_ulong,
+        type_: c_ulong,
+        format: c_int,
+        mode: c_int,
+        data: *const c_uchar,
+        nelements: c_int,
+    );
+    fn XFlush(display: *mut XDisplay);
+    fn XSendEvent(
+        display: *mut XDisplay,
+        w: c_ulong,
+        propagate: c_int,
+        event_mask: c_long,
+        event_send: *mut XEvent,
+    ) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union XClientMessageData {
+    l: [c_long; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XClientMessageEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut XDisplay,
+    window: c_ulong,
+    message_type: c_ulong,
+    format: c_int,
+    data: XClientMessageData,
+}
+
+#[repr(C)]
+union XEvent {
+    type_: c_int,
+    xclient: XClientMessageEvent,
+    pad: [c_long; 24],
+}
+
+const XA_ATOM: c_ulong = 4;
+const PROP_MODE_REPLACE: c_int = 0;
+const CLIENT_MESSAGE: c_int = 33;
+const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
+const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
+const NET_WM_STATE_ADD: c_long = 1;
+const NET_WM_STATE_SOURCE_APPLICATION: c_long = 1;
 
 pub struct OverlayUi {
     pub window: ApplicationWindow,
@@ -36,6 +114,106 @@ pub struct OverlayMeter {
 pub struct WaveformState {
     levels: VecDeque<f32>,
     level: f32,
+}
+
+pub(crate) fn prepare_overlay_window(window: &ApplicationWindow) {
+    window.set_can_target(false);
+    window.set_focus_on_click(false);
+
+    let Some(native) = window.native() else {
+        return;
+    };
+    let Some(surface) = native.surface() else {
+        return;
+    };
+
+    let display = surface.display();
+    if display.supports_input_shapes() {
+        // Make the overlay transparent to pointer hits so clicks reach the app below it.
+        surface.set_input_region(&gtk::cairo::Region::create());
+    }
+
+    if display.backend().is_x11() {
+        unsafe {
+            let surface: &gdk::Surface = surface.as_ref();
+            let display: &gdk::Display = display.as_ref();
+            let surface_ptr = surface.as_ptr() as *mut c_void;
+            let display_ptr = display.as_ptr() as *mut c_void;
+            let xdisplay = gdk_x11_display_get_xdisplay(display_ptr);
+            if xdisplay.is_null() {
+                return;
+            }
+
+            let net_wm_state = XInternAtom(xdisplay, b"_NET_WM_STATE\0".as_ptr(), 0);
+            let net_wm_state_above = XInternAtom(xdisplay, b"_NET_WM_STATE_ABOVE\0".as_ptr(), 0);
+            let net_wm_state_sticky = XInternAtom(xdisplay, b"_NET_WM_STATE_STICKY\0".as_ptr(), 0);
+            let net_wm_window_type = XInternAtom(xdisplay, b"_NET_WM_WINDOW_TYPE\0".as_ptr(), 0);
+            let net_wm_window_type_utility =
+                XInternAtom(xdisplay, b"_NET_WM_WINDOW_TYPE_UTILITY\0".as_ptr(), 0);
+
+            let xid = gdk_x11_surface_get_xid(surface_ptr);
+            if xid != 0 {
+                let above_states = [net_wm_state_above, net_wm_state_sticky];
+                XChangeProperty(
+                    xdisplay,
+                    xid,
+                    net_wm_state,
+                    XA_ATOM,
+                    32,
+                    PROP_MODE_REPLACE,
+                    above_states.as_ptr() as *const c_uchar,
+                    above_states.len() as c_int,
+                );
+
+                let utility_type = [net_wm_window_type_utility];
+                XChangeProperty(
+                    xdisplay,
+                    xid,
+                    net_wm_window_type,
+                    XA_ATOM,
+                    32,
+                    PROP_MODE_REPLACE,
+                    utility_type.as_ptr() as *const c_uchar,
+                    utility_type.len() as c_int,
+                );
+
+                let mut event = XEvent { pad: [0; 24] };
+                event.xclient = XClientMessageEvent {
+                    type_: CLIENT_MESSAGE,
+                    serial: 0,
+                    send_event: 1,
+                    display: xdisplay,
+                    window: xid,
+                    message_type: net_wm_state,
+                    format: 32,
+                    data: XClientMessageData {
+                        l: [
+                            NET_WM_STATE_ADD,
+                            net_wm_state_above as c_long,
+                            0,
+                            NET_WM_STATE_SOURCE_APPLICATION,
+                            0,
+                        ],
+                    },
+                };
+                let root = XDefaultRootWindow(xdisplay);
+                let _ = XSendEvent(
+                    xdisplay,
+                    root,
+                    0,
+                    SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+                    &mut event,
+                );
+            }
+
+            gdk_x11_surface_set_skip_taskbar_hint(surface_ptr, 1);
+            gdk_x11_surface_set_skip_pager_hint(surface_ptr, 1);
+            if xid != 0 {
+                let _ = XRaiseWindow(xdisplay, xid);
+            }
+            XFlush(xdisplay);
+        }
+    }
 }
 
 fn show_model_validation_error(parent: &ApplicationWindow, model_path: &str, error: &str) {
@@ -331,11 +509,13 @@ pub fn build_overlay(app: &Application) -> OverlayUi {
         .decorated(false)
         .resizable(false)
         .focusable(false)
+        .focus_on_click(false)
         .modal(false)
         .default_width(200)
         .default_height(40)
         .build();
     window.set_hide_on_close(true);
+    window.set_can_target(false);
     window.add_css_class("whisper-recording-overlay");
     let state = Rc::new(RefCell::new(WaveformState::default()));
     let area = DrawingArea::new();
@@ -344,6 +524,8 @@ pub fn build_overlay(app: &Application) -> OverlayUi {
     area.set_content_height(40);
     area.set_hexpand(false);
     area.set_vexpand(false);
+    area.set_can_target(false);
+    area.set_focus_on_click(false);
 
     let draw_state = state.clone();
     area.set_draw_func(move |_, cr, width, height| {
@@ -351,6 +533,10 @@ pub fn build_overlay(app: &Application) -> OverlayUi {
     });
 
     window.set_child(Some(&area));
+    window.connect_realize(|window| {
+        prepare_overlay_window(window);
+    });
+    prepare_overlay_window(&window);
 
     OverlayUi {
         window,
