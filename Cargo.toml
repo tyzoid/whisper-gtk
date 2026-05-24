@@ -17,9 +17,12 @@ exclude = [
 [dependencies]
 gtk = { package = "gtk4", version = "0.10.3" }
 glib = "0.21.5"
+futures-util = "0.3"
 libxdo = "0.6"
 pulse = { version = "2.0", package = "libpulse-binding" }
 psimple = { version = "2.0", package = "libpulse-simple-binding" }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "macros", "sync"] }
 whisper-rs = "0.16.0"

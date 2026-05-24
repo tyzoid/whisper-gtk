@@ -1,4 +1,8 @@
 use crate::config::{physical_core_count_from_cpuinfo, AppConfig, OutputMode};
+use crate::downloads::{
+    download_whisper_models_with, list_downloadable_whisper_models, model_selection_after_refresh,
+    DownloadableWhisperModel, WhisperModelDownloadEvent,
+};
 use crate::services::{
     append_recorded_s16le_chunk, hotkey_matches, keycode_is_down, list_whisper_models_from_roots,
     list_whisper_models_in, overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats,
@@ -7,7 +11,12 @@ use crate::services::{
 use crate::ui::{audio_source_selection_to_config, output_mode_selection_to_config, WaveformState};
 use gtk::gdk;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 
 #[test]
 fn config_roundtrip() {
@@ -283,6 +292,249 @@ fn whisper_model_scanner_includes_cache_layout() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn downloadable_model_manifest_includes_upstream_models() {
+    let models = list_downloadable_whisper_models();
+    let ids: Vec<&str> = models.iter().map(|model| model.model_id).collect();
+    for expected in [
+        "tiny",
+        "tiny.en",
+        "tiny-q5_1",
+        "tiny.en-q5_1",
+        "tiny-q8_0",
+        "tiny.en-q8_0",
+        "base",
+        "base.en",
+        "base-q5_1",
+        "base.en-q5_1",
+        "base-q8_0",
+        "base.en-q8_0",
+        "small",
+        "small.en",
+        "small.en-tdrz",
+        "small-q5_1",
+        "small.en-q5_1",
+        "small-q8_0",
+        "small.en-q8_0",
+        "medium",
+        "medium.en",
+        "medium-q5_0",
+        "medium.en-q5_0",
+        "medium-q8_0",
+        "medium.en-q8_0",
+        "large-v1",
+        "large-v2",
+        "large-v2-q5_0",
+        "large-v2-q8_0",
+        "large-v3",
+        "large-v3-q5_0",
+        "large-v3-turbo",
+        "large-v3-turbo-q5_0",
+        "large-v3-turbo-q8_0",
+    ] {
+        assert!(ids.contains(&expected), "missing model {expected}");
+    }
+}
+
+#[test]
+fn downloadable_model_manifest_generates_expected_paths_and_urls() {
+    let model = DownloadableWhisperModel {
+        family: "Small",
+        model_id: "small.en-tdrz",
+        quantization: "Default",
+        size_label: "465 MB",
+        size_bytes: 465 * 1024 * 1024,
+        repo: "akashmjn/tinydiarize-whisper.cpp",
+    };
+    let destination = PathBuf::from("/tmp/whisper-downloads");
+    assert_eq!(
+        model.destination_path(&destination),
+        destination.join("ggml-small.en-tdrz.bin")
+    );
+    assert_eq!(
+        model.temp_path(&destination),
+        destination.join("ggml-small.en-tdrz.bin.part")
+    );
+    assert_eq!(
+        model.download_url(),
+        "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml-small.en-tdrz.bin"
+    );
+}
+
+#[test]
+fn download_selection_refresh_preserves_configured_model() {
+    let available = vec![
+        PathBuf::from("/cache/ggml-base.en.bin"),
+        PathBuf::from("/cache/ggml-small.en.bin"),
+    ];
+    assert_eq!(
+        model_selection_after_refresh(&available, Some("/cache/custom.bin")),
+        "/cache/custom.bin"
+    );
+    assert_eq!(
+        model_selection_after_refresh(&available, Some("/cache/ggml-small.en.bin")),
+        "/cache/ggml-small.en.bin"
+    );
+}
+
+#[test]
+fn downloader_scheduler_limits_parallel_downloads_and_starts_next_when_one_finishes() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "whisper-gtk-download-scheduler-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::create_dir_all(&temp_root);
+
+    let models = vec![
+        fake_model("model-a"),
+        fake_model("model-b"),
+        fake_model("model-c"),
+        fake_model("model-d"),
+        fake_model("model-e"),
+    ];
+    let destination = temp_root.join("models");
+    let (tx, _rx) = mpsc::channel::<WhisperModelDownloadEvent>();
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let gates: Arc<Mutex<std::collections::HashMap<String, oneshot::Receiver<()>>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let mut release_senders = std::collections::HashMap::new();
+
+    for model in &models {
+        let (release_tx, release_rx) = oneshot::channel();
+        gates
+            .lock()
+            .unwrap()
+            .insert(model.model_id.to_string(), release_rx);
+        release_senders.insert(model.model_id.to_string(), release_tx);
+    }
+
+    let worker = {
+        let active = active.clone();
+        let max_active = max_active.clone();
+        let started = started.clone();
+        let gates = gates.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(download_whisper_models_with(
+                models,
+                destination,
+                4,
+                tx,
+                move |model, _destination, _sender| {
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let started = started.clone();
+                    let gates = gates.clone();
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        loop {
+                            let previous = max_active.load(Ordering::SeqCst);
+                            if current <= previous {
+                                break;
+                            }
+                            if max_active
+                                .compare_exchange(
+                                    previous,
+                                    current,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                        started.lock().unwrap().push(model.model_id.to_string());
+                        let rx = gates.lock().unwrap().remove(model.model_id).unwrap();
+                        let _ = rx.await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            ))
+        })
+    };
+
+    wait_until(
+        || started.lock().unwrap().len() == 4,
+        std::time::Duration::from_secs(2),
+    );
+    assert_eq!(max_active.load(Ordering::SeqCst), 4);
+    assert_eq!(started.lock().unwrap().len(), 4);
+    assert!(!started
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|model_id| model_id == "model-e"));
+
+    release_senders.remove("model-a").unwrap().send(()).unwrap();
+    wait_until(
+        || started.lock().unwrap().len() == 5,
+        std::time::Duration::from_secs(2),
+    );
+    assert!(started
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|model_id| model_id == "model-e"));
+
+    for model_id in ["model-b", "model-c", "model-d", "model-e"] {
+        let _ = release_senders.remove(model_id).unwrap().send(());
+    }
+
+    worker.join().unwrap();
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn downloader_scheduler_skips_existing_destination_files() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "whisper-gtk-download-skip-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let destination = temp_root.join("models");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("ggml-model-b.bin"), b"ready").unwrap();
+
+    let models = vec![fake_model("model-a"), fake_model("model-b")];
+    let (tx, rx) = mpsc::channel::<WhisperModelDownloadEvent>();
+    let called = Arc::new(AtomicUsize::new(0));
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let called_for_closure = called.clone();
+    rt.block_on(download_whisper_models_with(
+        models,
+        destination.clone(),
+        4,
+        tx,
+        move |model, _destination, _sender| {
+            let called_for_closure = called_for_closure.clone();
+            async move {
+                called_for_closure.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(model.model_id, "model-a");
+                Ok(())
+            }
+        },
+    ));
+
+    assert_eq!(called.load(Ordering::SeqCst), 1);
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WhisperModelDownloadEvent::Skipped { model_id, .. } if model_id == "model-b"
+    )));
+    let _ = fs::remove_dir_all(temp_root);
+}
+
 fn pcm_samples(amplitude: f32, samples: usize) -> Vec<u8> {
     let sample = (amplitude.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
     let mut bytes = Vec::with_capacity(samples * 2);
@@ -313,4 +565,23 @@ fn raw_to_wav_creates_header() {
     assert_eq!(&bytes[8..12], b"WAVE");
     let _ = fs::remove_file(raw);
     let _ = fs::remove_file(wav);
+}
+
+fn fake_model(model_id: &'static str) -> DownloadableWhisperModel {
+    DownloadableWhisperModel {
+        family: "Test",
+        model_id,
+        quantization: "Default",
+        size_label: "1 MB",
+        size_bytes: 1024 * 1024,
+        repo: "example/example",
+    }
+}
+
+fn wait_until(predicate: impl Fn() -> bool, timeout: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while !predicate() {
+        assert!(start.elapsed() < timeout, "timed out waiting for condition");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }

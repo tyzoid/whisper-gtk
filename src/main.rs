@@ -1,6 +1,7 @@
 #![allow(clashing_extern_declarations)]
 
 mod config;
+mod downloads;
 mod native;
 mod services;
 #[cfg(test)]

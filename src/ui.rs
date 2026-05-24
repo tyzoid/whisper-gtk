@@ -1,4 +1,9 @@
 use crate::config::{AppConfig, OutputMode};
+use crate::downloads::{
+    download_whisper_models, list_downloadable_whisper_models, model_selection_after_refresh,
+    whisper_download_cache_dir, DownloadableWhisperModel, WhisperModelDownloadEvent,
+    WhisperModelDownloadStatus,
+};
 use crate::services::{
     default_whisper_model_path, list_audio_sources, list_whisper_models,
     validate_whisper_model_path_in_subprocess, Hotkey,
@@ -9,17 +14,18 @@ use gtk::gdk::prelude::*;
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, CssProvider,
-    DrawingArea, DropDown, FileChooserAction, FileChooserNative, Frame, Grid, Image, Label,
-    MessageDialog, MessageType, Orientation, ResponseType, SignalListItemFactory, SpinButton,
-    StringList, StringObject, STYLE_PROVIDER_PRIORITY_APPLICATION,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, CenterBox,
+    CheckButton, CssProvider, DrawingArea, DropDown, Entry, FileChooserAction, FileChooserNative,
+    Frame, GestureClick, Grid, Image, Label, MessageDialog, MessageType, Orientation, ProgressBar,
+    ResponseType, ScrolledWindow, SignalListItemFactory, SpinButton, Stack, StringList,
+    StringObject, STYLE_PROVIDER_PRIORITY_APPLICATION,
 };
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::f64::consts::TAU;
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_long, c_uchar, c_ulong};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -98,6 +104,12 @@ const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
 const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
 const NET_WM_STATE_ADD: c_long = 1;
 const NET_WM_STATE_SOURCE_APPLICATION: c_long = 1;
+type ModelWarningIcons = Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>;
+const DOWNLOAD_CHEVRON_COLUMN_WIDTH: i32 = 16;
+const DOWNLOAD_MODEL_COLUMN_WIDTH: i32 = 268;
+const DOWNLOAD_QUANT_COLUMN_WIDTH: i32 = 150;
+const DOWNLOAD_SIZE_COLUMN_WIDTH: i32 = 92;
+const DOWNLOAD_STATUS_COLUMN_WIDTH: i32 = 116;
 const OVERLAY_MIC_ICON_HEIGHT: i32 = 20;
 const OVERLAY_MIC_ICON_ASPECT_RATIO: f64 = 462.86 / 688.86175;
 const OVERLAY_MIC_ICON_X: f64 = 16.0;
@@ -150,12 +162,28 @@ pub(crate) fn prepare_overlay_window(window: &ApplicationWindow) {
                 return;
             }
 
-            let net_wm_state = XInternAtom(xdisplay, b"_NET_WM_STATE\0".as_ptr(), 0);
-            let net_wm_state_above = XInternAtom(xdisplay, b"_NET_WM_STATE_ABOVE\0".as_ptr(), 0);
-            let net_wm_state_sticky = XInternAtom(xdisplay, b"_NET_WM_STATE_STICKY\0".as_ptr(), 0);
-            let net_wm_window_type = XInternAtom(xdisplay, b"_NET_WM_WINDOW_TYPE\0".as_ptr(), 0);
-            let net_wm_window_type_utility =
-                XInternAtom(xdisplay, b"_NET_WM_WINDOW_TYPE_UTILITY\0".as_ptr(), 0);
+            let net_wm_state =
+                XInternAtom(xdisplay, c"_NET_WM_STATE".as_ptr() as *const c_uchar, 0);
+            let net_wm_state_above = XInternAtom(
+                xdisplay,
+                c"_NET_WM_STATE_ABOVE".as_ptr() as *const c_uchar,
+                0,
+            );
+            let net_wm_state_sticky = XInternAtom(
+                xdisplay,
+                c"_NET_WM_STATE_STICKY".as_ptr() as *const c_uchar,
+                0,
+            );
+            let net_wm_window_type = XInternAtom(
+                xdisplay,
+                c"_NET_WM_WINDOW_TYPE".as_ptr() as *const c_uchar,
+                0,
+            );
+            let net_wm_window_type_utility = XInternAtom(
+                xdisplay,
+                c"_NET_WM_WINDOW_TYPE_UTILITY".as_ptr() as *const c_uchar,
+                0,
+            );
 
             let xid = gdk_x11_surface_get_xid(surface_ptr);
             if xid != 0 {
@@ -235,6 +263,823 @@ fn show_model_validation_error(parent: &ApplicationWindow, model_path: &str, err
     dialog.present();
 }
 
+fn refresh_model_dropdown_items(
+    config: &Arc<Mutex<AppConfig>>,
+    model_paths: Vec<PathBuf>,
+    model_entries: &StringList,
+    model_dropdown: &DropDown,
+    invalid_models: &Arc<Mutex<HashMap<String, bool>>>,
+    warning_icons: &ModelWarningIcons,
+    selection_guard: &Arc<Mutex<bool>>,
+) {
+    let current_model = config.lock().unwrap().model_path.clone();
+    let mut dropdown_paths = model_paths.clone();
+
+    if let Some(current_model) = current_model.as_deref() {
+        let has_model = dropdown_paths
+            .iter()
+            .any(|path| path.to_string_lossy() == current_model);
+        if !has_model {
+            dropdown_paths.push(PathBuf::from(current_model));
+        }
+    }
+
+    let item_count = model_entries.n_items();
+    if item_count > 0 {
+        model_entries.splice(0, item_count, &[]);
+    }
+    for model_path in &dropdown_paths {
+        model_entries.append(&model_path.to_string_lossy());
+    }
+    model_entries.append("Other...");
+
+    {
+        invalid_models.lock().unwrap().clear();
+        warning_icons.lock().unwrap().clear();
+    }
+
+    let selection = model_selection_after_refresh(&dropdown_paths, current_model.as_deref());
+    with_model_selection_guard(selection_guard, || {
+        let _ = dropdown_select_value(model_dropdown, model_entries, &selection);
+    });
+
+    validate_whisper_models_on_load(
+        dropdown_paths,
+        invalid_models.clone(),
+        warning_icons.clone(),
+    );
+}
+
+#[derive(Clone)]
+struct ModelRowWidgets {
+    model: DownloadableWhisperModel,
+    row: GtkBox,
+    check_button: CheckButton,
+    status_stack: Stack,
+    queued_progress: ProgressBar,
+    status_progress: ProgressBar,
+    status_label: Label,
+}
+
+impl ModelRowWidgets {
+    fn is_selected(&self) -> bool {
+        self.check_button.is_active()
+    }
+
+    fn set_visible(&self, visible: bool) {
+        self.row.set_visible(visible);
+    }
+
+    fn set_status(&self, status: WhisperModelDownloadStatus) {
+        match status {
+            WhisperModelDownloadStatus::Idle => {
+                self.status_label.set_label("—");
+                self.status_label.set_tooltip_text(None);
+                self.status_stack.set_visible_child_name("label");
+            }
+            WhisperModelDownloadStatus::Queued => {
+                self.status_label.set_tooltip_text(None);
+                self.queued_progress.pulse();
+                self.status_stack.set_visible_child_name("queued");
+            }
+            WhisperModelDownloadStatus::Downloading {
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                self.status_label.set_tooltip_text(None);
+                if let Some(total_bytes) = total_bytes.filter(|total| *total > 0) {
+                    self.status_progress.set_fraction(
+                        (downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0),
+                    );
+                    self.status_progress.set_show_text(false);
+                } else {
+                    self.status_progress.pulse();
+                }
+                self.status_stack.set_visible_child_name("progress");
+            }
+            WhisperModelDownloadStatus::Downloaded => {
+                self.status_label.set_label("Downloaded");
+                self.status_label.set_tooltip_text(None);
+                self.status_stack.set_visible_child_name("label");
+            }
+            WhisperModelDownloadStatus::Skipped => {
+                self.status_label.set_label("Already downloaded");
+                self.status_label.set_tooltip_text(None);
+                self.status_stack.set_visible_child_name("label");
+            }
+            WhisperModelDownloadStatus::Failed(error) => {
+                self.status_label.set_label("Failed");
+                self.status_label.set_tooltip_text(Some(&error));
+                self.status_stack.set_visible_child_name("label");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GroupWidgets {
+    header: GtkBox,
+    expand_icon: Image,
+    select_all: CheckButton,
+    children: GtkBox,
+    expanded: Rc<RefCell<bool>>,
+    row_indices: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct DownloadDialogState {
+    rows: Vec<ModelRowWidgets>,
+    groups: Vec<GroupWidgets>,
+    global_select_all: CheckButton,
+    download_button: Button,
+    search_entry: Entry,
+    selection_guard: Rc<RefCell<bool>>,
+    queued_model_ids: Rc<RefCell<HashSet<&'static str>>>,
+}
+
+impl DownloadDialogState {
+    fn selected_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.is_selected()).count()
+    }
+
+    fn eligible_selected_models(&self) -> Vec<DownloadableWhisperModel> {
+        self.rows
+            .iter()
+            .filter(|row| row.is_selected())
+            .map(|row| row.model)
+            .collect()
+    }
+
+    fn update_action_labels(&self) {
+        let count = self.selected_count();
+        self.download_button
+            .set_label(&format!("Download Selected ({count})"));
+        self.download_button.set_sensitive(count > 0);
+    }
+
+    fn with_selection_guard(&self, f: impl FnOnce()) {
+        {
+            let mut guard = self.selection_guard.borrow_mut();
+            if *guard {
+                return;
+            }
+            *guard = true;
+        }
+        f();
+        *self.selection_guard.borrow_mut() = false;
+    }
+
+    fn update_group_checks(&self) {
+        let any_selected = self.rows.iter().any(|row| row.is_selected());
+        self.with_selection_guard(|| {
+            self.global_select_all
+                .set_active(any_selected && self.rows.iter().all(|row| row.is_selected()));
+            self.global_select_all
+                .set_inconsistent(any_selected && !self.rows.iter().all(|row| row.is_selected()));
+
+            for group in &self.groups {
+                let rows = group
+                    .row_indices
+                    .iter()
+                    .filter_map(|index| self.rows.get(*index))
+                    .collect::<Vec<_>>();
+                let selected = rows.iter().filter(|row| row.is_selected()).count();
+                let all_selected = !rows.is_empty() && selected == rows.len();
+                let some_selected = selected > 0;
+                group.select_all.set_active(all_selected);
+                group
+                    .select_all
+                    .set_inconsistent(some_selected && !all_selected);
+            }
+        });
+    }
+
+    fn apply_filter(&self) {
+        let query = self.search_entry.text().to_string();
+        let query = query.trim().to_lowercase();
+
+        for group in &self.groups {
+            let expanded = *group.expanded.borrow();
+            let mut any_match = false;
+
+            for index in &group.row_indices {
+                let row = &self.rows[*index];
+                let matches = query.is_empty() || row.model.matches_query(&query);
+                any_match |= matches;
+                row.set_visible(matches);
+            }
+
+            let group_visible = query.is_empty() || any_match;
+            group.header.set_visible(group_visible);
+            group
+                .children
+                .set_visible(group_visible && (expanded || !query.is_empty()));
+            group.expand_icon.set_icon_name(Some(if expanded {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+        }
+    }
+
+    fn select_all_models(&self, selected: bool) {
+        self.with_selection_guard(|| {
+            for row in &self.rows {
+                row.check_button.set_active(selected);
+            }
+        });
+        self.update_group_checks();
+        self.update_action_labels();
+    }
+
+    fn update_from_row_toggle(&self) {
+        self.update_group_checks();
+        self.update_action_labels();
+    }
+}
+
+fn build_downloadable_model_row(
+    model: DownloadableWhisperModel,
+    download_destination: &Path,
+) -> ModelRowWidgets {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.set_hexpand(true);
+    row.add_css_class("whisper-download-row");
+    row.set_margin_start(0);
+    row.set_margin_end(0);
+    row.set_margin_top(0);
+    row.set_margin_bottom(0);
+
+    let check_button = CheckButton::new();
+    check_button.set_valign(Align::Center);
+
+    let model_label = Label::new(Some(model.model_id));
+    model_label.set_hexpand(true);
+    model_label.set_xalign(0.0);
+    model_label.set_valign(Align::Center);
+    model_label.set_width_chars(18);
+
+    let model_cell = GtkBox::new(Orientation::Horizontal, 8);
+    model_cell.set_hexpand(false);
+    model_cell.set_size_request(DOWNLOAD_MODEL_COLUMN_WIDTH, -1);
+    model_cell.append(&check_button);
+    model_cell.append(&model_label);
+
+    let quant_label = Label::new(Some(model.quantization));
+    quant_label.set_xalign(0.0);
+    quant_label.set_valign(Align::Center);
+    quant_label.set_size_request(DOWNLOAD_QUANT_COLUMN_WIDTH, -1);
+
+    let size_label = Label::new(Some(model.size_label));
+    size_label.set_xalign(1.0);
+    size_label.set_valign(Align::Center);
+    size_label.set_size_request(DOWNLOAD_SIZE_COLUMN_WIDTH, -1);
+
+    let status_stack = Stack::new();
+    status_stack.set_hexpand(false);
+    status_stack.set_valign(Align::Center);
+    status_stack.set_size_request(DOWNLOAD_STATUS_COLUMN_WIDTH, -1);
+
+    let queued_progress = ProgressBar::new();
+    queued_progress.add_css_class("whisper-download-queued-progress");
+    queued_progress.set_hexpand(false);
+    queued_progress.set_valign(Align::Center);
+    queued_progress.set_show_text(false);
+    queued_progress.set_pulse_step(0.18);
+    queued_progress.set_size_request(DOWNLOAD_STATUS_COLUMN_WIDTH, -1);
+    let status_progress = ProgressBar::new();
+    status_progress.set_hexpand(false);
+    status_progress.set_valign(Align::Center);
+    status_progress.set_show_text(false);
+    status_progress.set_size_request(DOWNLOAD_STATUS_COLUMN_WIDTH, -1);
+    let status_label = Label::new(Some("—"));
+    status_label.set_valign(Align::Center);
+    status_label.set_xalign(0.0);
+
+    status_stack.add_named(&status_label, Some("label"));
+    status_stack.add_named(&queued_progress, Some("queued"));
+    status_stack.add_named(&status_progress, Some("progress"));
+    status_stack.set_visible_child_name("label");
+
+    row.append(&download_chevron_spacer());
+    row.append(&model_cell);
+    row.append(&quant_label);
+    row.append(&size_label);
+    row.append(&status_stack);
+
+    let widgets = ModelRowWidgets {
+        model,
+        row,
+        check_button,
+        status_stack,
+        queued_progress,
+        status_progress,
+        status_label,
+    };
+    if model.destination_path(download_destination).is_file() {
+        widgets.set_status(WhisperModelDownloadStatus::Downloaded);
+    } else {
+        widgets.set_status(WhisperModelDownloadStatus::Idle);
+    }
+    widgets
+}
+
+fn download_chevron_spacer() -> Label {
+    let spacer = Label::new(None);
+    spacer.set_size_request(DOWNLOAD_CHEVRON_COLUMN_WIDTH, -1);
+    spacer
+}
+
+fn build_download_group_header(
+    family: &'static str,
+    expanded: Rc<RefCell<bool>>,
+    children: &GtkBox,
+    row_indices: Vec<usize>,
+) -> GroupWidgets {
+    let header = GtkBox::new(Orientation::Horizontal, 12);
+    header.set_hexpand(true);
+    header.add_css_class("whisper-download-group");
+    header.set_margin_start(0);
+    header.set_margin_end(0);
+    header.set_margin_top(0);
+    header.set_margin_bottom(0);
+
+    let clickable_area = GtkBox::new(Orientation::Horizontal, 12);
+    clickable_area.set_hexpand(false);
+    clickable_area.set_tooltip_text(Some("Expand or collapse this model group"));
+
+    let reveal_cell = CenterBox::new();
+    reveal_cell.set_size_request(DOWNLOAD_CHEVRON_COLUMN_WIDTH, -1);
+    let expand_icon = Image::from_icon_name("pan-down-symbolic");
+    expand_icon.set_halign(Align::Center);
+    expand_icon.set_valign(Align::Center);
+    expand_icon.set_margin_end(-6);
+    expand_icon.set_margin_start(6);
+    reveal_cell.set_center_widget(Some(&expand_icon));
+
+    let title = Label::new(Some(family));
+    title.set_hexpand(false);
+    title.set_xalign(0.0);
+    title.set_size_request(DOWNLOAD_MODEL_COLUMN_WIDTH, -1);
+
+    let quant_spacer = Label::new(None);
+    quant_spacer.set_size_request(DOWNLOAD_QUANT_COLUMN_WIDTH, -1);
+
+    let group_size_label = group_download_size_label(family);
+    let size_label = Label::new(if *expanded.borrow() {
+        None
+    } else {
+        Some(group_size_label.as_str())
+    });
+    size_label.set_xalign(1.0);
+    size_label.set_size_request(DOWNLOAD_SIZE_COLUMN_WIDTH, -1);
+
+    let select_all = CheckButton::with_label("Select all");
+    select_all.set_halign(Align::End);
+    select_all.set_valign(Align::Center);
+    select_all.set_size_request(DOWNLOAD_STATUS_COLUMN_WIDTH, -1);
+
+    clickable_area.append(&reveal_cell);
+    clickable_area.append(&title);
+    clickable_area.append(&quant_spacer);
+    clickable_area.append(&size_label);
+    header.append(&clickable_area);
+    header.append(&select_all);
+
+    let children_for_toggle = children.clone();
+    let expand_icon_for_toggle = expand_icon.clone();
+    let size_label_for_toggle = size_label.clone();
+    let expanded_for_toggle = expanded.clone();
+    let click_controller = GestureClick::new();
+    click_controller.connect_released(move |_, _, _, _| {
+        let mut expanded = expanded_for_toggle.borrow_mut();
+        *expanded = !*expanded;
+        children_for_toggle.set_visible(*expanded);
+        size_label_for_toggle.set_label(if *expanded { "" } else { &group_size_label });
+        expand_icon_for_toggle.set_icon_name(Some(if *expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
+    });
+    clickable_area.add_controller(click_controller);
+
+    GroupWidgets {
+        header,
+        expand_icon,
+        select_all,
+        children: children.clone(),
+        expanded,
+        row_indices,
+    }
+}
+
+fn group_download_size_label(family: &str) -> String {
+    let total_bytes = list_downloadable_whisper_models()
+        .iter()
+        .filter(|model| model.family == family)
+        .map(|model| model.size_bytes)
+        .sum();
+    format_download_size(total_bytes)
+}
+
+fn format_download_size(bytes: u64) -> String {
+    let (value, unit) = if bytes >= 1_000_000_000 {
+        (bytes as f64 / 1_000_000_000.0, "GB")
+    } else {
+        (bytes as f64 / 1_000_000.0, "MB")
+    };
+
+    let label = format!("{value:.2}");
+    let label = label.trim_end_matches('0').trim_end_matches('.');
+    format!("{label} {unit}")
+}
+
+fn open_model_download_window(
+    parent: &ApplicationWindow,
+    config: Arc<Mutex<AppConfig>>,
+    model_dropdown: DropDown,
+    model_entries: StringList,
+    invalid_models: Arc<Mutex<HashMap<String, bool>>>,
+    warning_icons: ModelWarningIcons,
+    selection_guard: Arc<Mutex<bool>>,
+) {
+    let Some(app) = parent.application() else {
+        return;
+    };
+
+    let window = ApplicationWindow::builder()
+        .application(&app)
+        .title("Download Models")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(790)
+        .default_height(820)
+        .build();
+    window.set_hide_on_close(true);
+
+    let root = GtkBox::new(Orientation::Vertical, 12);
+    root.set_margin_top(16);
+    root.set_margin_bottom(16);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
+
+    let title = Label::new(Some("Select one or more models to download."));
+    title.set_halign(Align::Start);
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+
+    let subtitle = Label::new(Some(
+        "Larger models require more disk space and processing time.",
+    ));
+    subtitle.set_halign(Align::Start);
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+
+    let search_row = GtkBox::new(Orientation::Horizontal, 12);
+    let search_entry = Entry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Search models..."));
+    let global_select_all = CheckButton::with_label("Select all");
+    global_select_all.set_halign(Align::End);
+    global_select_all.set_valign(Align::Center);
+    search_row.append(&search_entry);
+    search_row.append(&global_select_all);
+
+    let header_row = GtkBox::new(Orientation::Horizontal, 12);
+    header_row.add_css_class("whisper-download-header");
+    header_row.set_margin_start(0);
+    header_row.set_margin_end(0);
+    header_row.set_margin_top(0);
+    header_row.set_margin_bottom(0);
+    let header_model = Label::new(Some("Model"));
+    header_model.set_hexpand(false);
+    header_model.set_xalign(0.0);
+    header_model.set_size_request(DOWNLOAD_MODEL_COLUMN_WIDTH, -1);
+    let header_quant = Label::new(Some("Quantization"));
+    header_quant.set_xalign(0.0);
+    header_quant.set_size_request(DOWNLOAD_QUANT_COLUMN_WIDTH, -1);
+    let header_size = Label::new(Some("Size"));
+    header_size.set_xalign(1.0);
+    header_size.set_size_request(DOWNLOAD_SIZE_COLUMN_WIDTH, -1);
+    let header_status = Label::new(Some("Status"));
+    header_status.set_xalign(0.0);
+    header_status.set_size_request(DOWNLOAD_STATUS_COLUMN_WIDTH, -1);
+    header_row.append(&download_chevron_spacer());
+    header_row.append(&header_model);
+    header_row.append(&header_quant);
+    header_row.append(&header_size);
+    header_row.append(&header_status);
+
+    let scroller = ScrolledWindow::new();
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_min_content_height(560);
+
+    let list_column = GtkBox::new(Orientation::Vertical, 0);
+    list_column.set_hexpand(true);
+
+    let rows = Rc::new(RefCell::new(Vec::<ModelRowWidgets>::new()));
+    let groups = Rc::new(RefCell::new(Vec::<GroupWidgets>::new()));
+    let download_selection_guard = Rc::new(RefCell::new(false));
+    let download_destination = whisper_download_cache_dir();
+
+    let mut grouped_rows: HashMap<&'static str, Vec<usize>> = HashMap::new();
+    for model in list_downloadable_whisper_models().iter().copied() {
+        grouped_rows
+            .entry(model.family)
+            .or_default()
+            .push(rows.borrow().len());
+        rows.borrow_mut()
+            .push(build_downloadable_model_row(model, &download_destination));
+    }
+
+    let family_order = [
+        "Tiny",
+        "Base",
+        "Small",
+        "Medium",
+        "Large-v1",
+        "Large-v2",
+        "Large-v3",
+        "Large-v3-turbo",
+    ];
+
+    for family in family_order {
+        let row_indices = grouped_rows.remove(family).unwrap_or_default();
+        if row_indices.is_empty() {
+            continue;
+        }
+
+        let expanded = Rc::new(RefCell::new(
+            family != "Medium"
+                && family != "Large-v1"
+                && family != "Large-v2"
+                && family != "Large-v3"
+                && family != "Large-v3-turbo",
+        ));
+        let children = GtkBox::new(Orientation::Vertical, 0);
+        children.set_hexpand(true);
+        for index in &row_indices {
+            if let Some(row) = rows.borrow().get(*index) {
+                children.append(&row.row);
+            }
+        }
+        children.set_visible(*expanded.borrow());
+
+        let group = build_download_group_header(family, expanded, &children, row_indices.clone());
+        list_column.append(&group.header);
+        list_column.append(&children);
+        groups.borrow_mut().push(group);
+    }
+
+    scroller.set_child(Some(&list_column));
+
+    let table_box = GtkBox::new(Orientation::Vertical, 0);
+    table_box.append(&header_row);
+    table_box.append(&scroller);
+
+    let table_frame = Frame::new(None);
+    table_frame.add_css_class("whisper-download-table");
+    table_frame.set_hexpand(true);
+    table_frame.set_vexpand(true);
+    table_frame.set_child(Some(&table_box));
+
+    let action_row = GtkBox::new(Orientation::Horizontal, 12);
+    let close_button = Button::with_label("Close");
+    close_button.set_size_request(92, -1);
+    let download_button = Button::with_label("Download Selected (0)");
+    download_button.set_sensitive(false);
+    download_button.set_size_request(210, -1);
+    let action_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    action_spacer.set_hexpand(true);
+    action_row.append(&close_button);
+    action_row.append(&action_spacer);
+    action_row.append(&download_button);
+
+    root.append(&title);
+    root.append(&subtitle);
+    root.append(&search_row);
+    root.append(&table_frame);
+    root.append(&action_row);
+
+    window.set_child(Some(&root));
+
+    let state = Rc::new(DownloadDialogState {
+        rows: rows.borrow().clone(),
+        groups: groups.borrow().clone(),
+        global_select_all: global_select_all.clone(),
+        download_button: download_button.clone(),
+        search_entry: search_entry.clone(),
+        selection_guard: download_selection_guard.clone(),
+        queued_model_ids: Rc::new(RefCell::new(HashSet::new())),
+    });
+    state.update_group_checks();
+    state.update_action_labels();
+    state.apply_filter();
+
+    for row in &state.rows {
+        let state = state.clone();
+        row.check_button.connect_toggled(move |_| {
+            if *state.selection_guard.borrow() {
+                return;
+            }
+            state.update_from_row_toggle();
+        });
+    }
+
+    {
+        let state = state.clone();
+        search_entry.connect_changed(move |_| {
+            state.apply_filter();
+        });
+    }
+
+    {
+        let state = state.clone();
+        global_select_all.connect_toggled(move |check| {
+            if *state.selection_guard.borrow() {
+                return;
+            }
+            state.select_all_models(check.is_active());
+        });
+    }
+
+    for group in &state.groups {
+        let state = state.clone();
+        let group = group.clone();
+        group.select_all.connect_toggled(move |check| {
+            if *state.selection_guard.borrow() {
+                return;
+            }
+
+            let selected = check.is_active();
+            state.with_selection_guard(|| {
+                for index in &group.row_indices {
+                    if let Some(row) = state.rows.get(*index) {
+                        row.check_button.set_active(selected);
+                    }
+                }
+            });
+            state.update_group_checks();
+            state.update_action_labels();
+        });
+    }
+
+    let model_dropdown = model_dropdown.clone();
+    let model_entries = model_entries.clone();
+    let config_for_refresh = config.clone();
+    let invalid_models_for_refresh = invalid_models.clone();
+    let warning_icons_for_refresh = warning_icons.clone();
+    let selection_guard_for_refresh = selection_guard.clone();
+    let refresh_models = Rc::new(move || {
+        let model_paths = list_whisper_models();
+        refresh_model_dropdown_items(
+            &config_for_refresh,
+            model_paths,
+            &model_entries,
+            &model_dropdown,
+            &invalid_models_for_refresh,
+            &warning_icons_for_refresh,
+            &selection_guard_for_refresh,
+        );
+    });
+
+    let download_state = state.clone();
+    let refresh_models_for_download = refresh_models.clone();
+    let row_map = {
+        let mut map = HashMap::new();
+        for row in &download_state.rows {
+            map.insert(row.model.model_id.to_string(), row.clone());
+        }
+        Rc::new(map)
+    };
+
+    download_button.connect_clicked(move |_| {
+        let selected_models = download_state.eligible_selected_models();
+        if selected_models.is_empty() {
+            return;
+        }
+
+        let destination = whisper_download_cache_dir();
+        let (sender, receiver) = std::sync::mpsc::channel::<WhisperModelDownloadEvent>();
+        let pending = Rc::new(RefCell::new(selected_models.len()));
+        let pending_for_events = pending.clone();
+        let pending_for_queue_pulse = pending.clone();
+        let refresh_models = refresh_models_for_download.clone();
+        let row_map = row_map.clone();
+        let queued_model_ids = download_state.queued_model_ids.clone();
+        queued_model_ids.borrow_mut().clear();
+
+        download_whisper_models(selected_models, destination, 4, sender);
+
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    WhisperModelDownloadEvent::Queued { model_id } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            queued_model_ids.borrow_mut().insert(row.model.model_id);
+                            row.set_status(WhisperModelDownloadStatus::Queued);
+                        }
+                    }
+                    WhisperModelDownloadEvent::Started {
+                        model_id,
+                        total_bytes,
+                    } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            queued_model_ids.borrow_mut().remove(row.model.model_id);
+                            row.set_status(WhisperModelDownloadStatus::Downloading {
+                                downloaded_bytes: 0,
+                                total_bytes,
+                            });
+                        }
+                    }
+                    WhisperModelDownloadEvent::Progress {
+                        model_id,
+                        downloaded_bytes,
+                        total_bytes,
+                    } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            row.set_status(WhisperModelDownloadStatus::Downloading {
+                                downloaded_bytes,
+                                total_bytes,
+                            });
+                        }
+                    }
+                    WhisperModelDownloadEvent::Downloaded { model_id, .. } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            queued_model_ids.borrow_mut().remove(row.model.model_id);
+                            row.set_status(WhisperModelDownloadStatus::Downloaded);
+                        }
+                        let mut remaining = pending_for_events.borrow_mut();
+                        let next = (*remaining).saturating_sub(1);
+                        *remaining = next;
+                        if *remaining == 0 {
+                            refresh_models();
+                        }
+                    }
+                    WhisperModelDownloadEvent::Skipped { model_id, .. } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            queued_model_ids.borrow_mut().remove(row.model.model_id);
+                            row.set_status(WhisperModelDownloadStatus::Skipped);
+                        }
+                        let mut remaining = pending_for_events.borrow_mut();
+                        let next = (*remaining).saturating_sub(1);
+                        *remaining = next;
+                        if *remaining == 0 {
+                            refresh_models();
+                        }
+                    }
+                    WhisperModelDownloadEvent::Failed { model_id, error } => {
+                        if let Some(row) = row_map.get(&model_id) {
+                            queued_model_ids.borrow_mut().remove(row.model.model_id);
+                            row.set_status(WhisperModelDownloadStatus::Failed(error));
+                        }
+                        let mut remaining = pending_for_events.borrow_mut();
+                        let next = (*remaining).saturating_sub(1);
+                        *remaining = next;
+                        if *remaining == 0 {
+                            refresh_models();
+                        }
+                    }
+                }
+            }
+
+            if *pending_for_events.borrow() == 0 {
+                gtk::glib::ControlFlow::Break
+            } else {
+                gtk::glib::ControlFlow::Continue
+            }
+        });
+
+        let rows = download_state.rows.clone();
+        let queued_model_ids = download_state.queued_model_ids.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+            let queued = queued_model_ids.borrow();
+            if queued.is_empty() && *pending_for_queue_pulse.borrow() == 0 {
+                return gtk::glib::ControlFlow::Break;
+            }
+
+            for row in &rows {
+                if queued.contains(row.model.model_id) {
+                    row.queued_progress.pulse();
+                }
+            }
+
+            gtk::glib::ControlFlow::Continue
+        });
+    });
+
+    close_button.connect_clicked({
+        let window = window.clone();
+        move |_| {
+            window.close();
+        }
+    });
+
+    window.present();
+}
+
 fn ellipsized_dropdown(model: &StringList, ellipsize: EllipsizeMode) -> DropDown {
     let factory = SignalListItemFactory::new();
     factory.connect_setup(move |_, item| {
@@ -274,7 +1119,7 @@ fn model_dropdown_with_validation(
     model: &StringList,
     ellipsize: EllipsizeMode,
     invalid_models: Arc<Mutex<HashMap<String, bool>>>,
-    warning_icons: Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+    warning_icons: ModelWarningIcons,
 ) -> DropDown {
     let factory = SignalListItemFactory::new();
     let invalid_models_for_bind = invalid_models.clone();
@@ -431,31 +1276,6 @@ fn build_dropdown_from_strings(
     (list, dropdown)
 }
 
-fn default_model_selection(model_paths: &[std::path::PathBuf], cfg: &AppConfig) -> String {
-    if let Some(path) = cfg.model_path.as_deref() {
-        let path = path.to_string();
-        if model_paths
-            .iter()
-            .any(|model_path| model_path.to_string_lossy() == path)
-        {
-            return path;
-        }
-    }
-
-    let default = default_whisper_model_path().to_string_lossy().to_string();
-    if model_paths
-        .iter()
-        .any(|model_path| model_path.to_string_lossy() == default)
-    {
-        return default;
-    }
-
-    model_paths
-        .first()
-        .map(|model_path| model_path.to_string_lossy().to_string())
-        .unwrap_or_else(|| "Other...".to_string())
-}
-
 fn install_settings_css() {
     let Some(display) = gdk::Display::default() else {
         return;
@@ -474,6 +1294,29 @@ fn install_settings_css() {
             font-weight: 700;
         }
 
+        .whisper-download-table {
+            background: #ffffff;
+            border: 1px solid alpha(@theme_fg_color, 0.18);
+            border-radius: 6px;
+        }
+
+        .whisper-download-header {
+			padding: 5px 0px;
+            background: #ffffff;
+            border-bottom: 1px solid alpha(@theme_fg_color, 0.12);
+        }
+
+        .whisper-download-group {
+            background-color: #f7f7f7;
+            border-bottom: 1px solid alpha(@theme_fg_color, 0.10);
+        }
+
+        .whisper-download-row {
+			padding: 5px 0px;
+            background: #ffffff;
+            border-bottom: 1px solid alpha(@theme_fg_color, 0.08);
+        }
+
         "#,
     );
 
@@ -488,7 +1331,7 @@ fn refresh_model_warning_icons(
     model_path: &str,
     is_invalid: bool,
     invalid_models: &Arc<Mutex<HashMap<String, bool>>>,
-    warning_icons: &Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+    warning_icons: &ModelWarningIcons,
 ) {
     invalid_models
         .lock()
@@ -511,7 +1354,7 @@ fn refresh_model_warning_icons(
 fn validate_whisper_models_on_load(
     model_paths: Vec<std::path::PathBuf>,
     invalid_models: Arc<Mutex<HashMap<String, bool>>>,
-    warning_icons: Arc<Mutex<HashMap<String, Vec<gtk::glib::SendWeakRef<Image>>>>>,
+    warning_icons: ModelWarningIcons,
 ) {
     std::thread::spawn(move || {
         for model_path in model_paths {
@@ -962,11 +1805,6 @@ pub fn build_settings_window(
 
     let model_paths = list_whisper_models();
     let model_entries = StringList::new(&[]);
-    for model_path in &model_paths {
-        let model_path = model_path.to_string_lossy();
-        model_entries.append(model_path.as_ref());
-    }
-    model_entries.append("Other...");
     let model_validation_state = Arc::new(Mutex::new(HashMap::new()));
     let model_warning_icons = Arc::new(Mutex::new(HashMap::new()));
     let model_dropdown = model_dropdown_with_validation(
@@ -977,6 +1815,9 @@ pub fn build_settings_window(
     );
     model_dropdown.set_halign(Align::Fill);
     let model_browse_button = Button::with_label("Browse...");
+    model_browse_button.set_hexpand(true);
+    let model_download_button = Button::with_label("Download Models");
+    model_download_button.set_hexpand(true);
     let model_selection_guard = Arc::new(Mutex::new(false));
 
     let (general_card, general_body) =
@@ -1028,9 +1869,20 @@ pub fn build_settings_window(
     model_grid.set_row_spacing(12);
     model_grid.set_hexpand(true);
 
-    model_grid.attach(&model_dropdown, 0, 0, 1, 1);
-    model_grid.attach(&model_browse_button, 1, 0, 1, 1);
+    model_grid.attach(&model_dropdown, 0, 0, 2, 1);
+    model_grid.attach(&model_browse_button, 0, 1, 1, 1);
+    model_grid.attach(&model_download_button, 1, 1, 1, 1);
     model_body.append(&model_grid);
+
+    refresh_model_dropdown_items(
+        &config,
+        model_paths.clone(),
+        &model_entries,
+        &model_dropdown,
+        &model_validation_state,
+        &model_warning_icons,
+        &model_selection_guard,
+    );
 
     let cfg = config.lock().unwrap().clone();
     let current_hotkey = Hotkey::parse(&cfg.hotkey)
@@ -1046,13 +1898,6 @@ pub fn build_settings_window(
     let _ = dropdown_select_value(&mode_dropdown, &mode_list, mode_value);
     duration_spin.set_value(cfg.max_recording_secs as f64);
     threads_spin.set_value(cfg.whisper_threads.max(1) as f64);
-    let current_model = default_model_selection(&model_paths, &cfg);
-    let _ = dropdown_select_value(&model_dropdown, &model_entries, &current_model);
-    validate_whisper_models_on_load(
-        model_paths.clone(),
-        model_validation_state.clone(),
-        model_warning_icons.clone(),
-    );
 
     let capture_mode = std::rc::Rc::new(std::cell::RefCell::new(false));
     let capture_mode_button = capture_mode.clone();
@@ -1267,7 +2112,7 @@ pub fn build_settings_window(
             parent,
             combo,
             model_entries,
-            model_selection_guard.clone(),
+            model_selection_guard_for_combo.clone(),
             id,
             false,
             current_model_for_restore,
@@ -1277,6 +2122,25 @@ pub fn build_settings_window(
     let open_model_picker_for_button = open_model_picker.clone();
     model_browse_button.connect_clicked(move |_| {
         open_model_picker_for_button();
+    });
+
+    let config_for_download = config.clone();
+    let model_dropdown_for_download = model_dropdown.clone();
+    let model_entries_for_download = model_entries.clone();
+    let invalid_models_for_download = model_validation_state.clone();
+    let warning_icons_for_download = model_warning_icons.clone();
+    let selection_guard_for_download = model_selection_guard.clone();
+    let window_for_download = window.clone();
+    model_download_button.connect_clicked(move |_| {
+        open_model_download_window(
+            &window_for_download,
+            config_for_download.clone(),
+            model_dropdown_for_download.clone(),
+            model_entries_for_download.clone(),
+            invalid_models_for_download.clone(),
+            warning_icons_for_download.clone(),
+            selection_guard_for_download.clone(),
+        );
     });
 
     let config_for_duration = config.clone();
