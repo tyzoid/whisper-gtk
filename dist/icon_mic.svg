@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   id="svg2"
+   viewBox="0 0 462.86 688.86175"
+   version="1.1"
+   sodipodi:docname="icon_mic2.svg"
+   width="462.85999"
+   height="688.86176"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   xmlns:cc="http://creativecommons.org/ns#"
+   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <defs
+     id="defs1" />
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#666666"
+     borderopacity="1.0"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="0.70709784"
+     inkscape:cx="165.46508"
+     inkscape:cy="303.35264"
+     inkscape:window-width="1920"
+     inkscape:window-height="1135"
+     inkscape:window-x="1050"
+     inkscape:window-y="513"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <g
+     id="layer1"
+     stroke="#000000"
+     transform="translate(-140.614,-273.2125)">
+    <path
+       id="path2985"
+       opacity="0.99"
+       d="m 568.57,620.93 c 0,116.77 -94.66,211.43 -211.43,211.43 -116.77,0 -211.43,-94.66 -211.43,-211.43 v -10e-6"
+       fill-opacity="0"
+       transform="translate(14.904)"
+       stroke-linecap="round"
+       stroke-width="20" />
+    <path
+       id="path2987"
+       opacity="0.99"
+       d="m 568.57,620.93 c 0,116.77 -94.66,211.43 -211.43,211.43 -116.77,0 -211.43,-94.66 -211.43,-211.43 v -10e-6"
+       fill-opacity="0"
+       transform="translate(14.904)"
+       stroke-linecap="round"
+       stroke-width="40" />
+    <path
+       id="path2989"
+       d="M 372.05,832.36 V 946.65"
+       stroke-width="30"
+       fill="none"
+       style="stroke-width:40;stroke-dasharray:none" />
+    <path
+       id="path2997"
+       opacity="0.99"
+       stroke-width="21.455"
+       stroke-linecap="round"
+       d="m 372.06,283.94 c -77.019,-10e-6 -139.47,62.45 -139.47,139.47 v 189.62 c 0,77.019 62.45,139.47 139.47,139.47 77.019,0 139.44,-62.45 139.44,-139.47 V 423.41 c 0,-77.02 -62.42,-139.47 -139.44,-139.47 z"
+       sodipodi:nodetypes="sssssss" />
+    <path
+       id="path1"
+       d="M 542.33351,942.07426 H 201.76649"
+       stroke-width="51.7867"
+       fill="none"
+       style="fill:#000000;stroke:#000000;stroke-width:40;stroke-linecap:round;stroke-dasharray:none" />
+  </g>
+  <metadata
+     id="metadata1">
+    <rdf:RDF>
+      <cc:Work>
+        <dc:format>image/svg+xml</dc:format>
+        <dc:type
+           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+        <cc:license
+           rdf:resource="http://creativecommons.org/publicdomain/zero/1.0/" />
+        <dc:publisher>
+          <cc:Agent
+             rdf:about="http://openclipart.org/">
+            <dc:title>Openclipart</dc:title>
+          </cc:Agent>
+        </dc:publisher>
+        <dc:title>Mic icon</dc:title>
+        <dc:date>2013-10-10T23:57:40</dc:date>
+        <dc:description>A simple mic icon for example for apps</dc:description>
+        <dc:source>https://openclipart.org/detail/184774/mic-icon-by-upacesky-184774</dc:source>
+        <dc:creator>
+          <cc:Agent>
+            <dc:title>Upacesky</dc:title>
+          </cc:Agent>
+        </dc:creator>
+        <dc:subject>
+          <rdf:Bag>
+            <rdf:li>app</rdf:li>
+            <rdf:li>audio</rdf:li>
+            <rdf:li>icon</rdf:li>
+            <rdf:li>mic</rdf:li>
+            <rdf:li>microphone</rdf:li>
+            <rdf:li>music</rdf:li>
+            <rdf:li>recording</rdf:li>
+          </rdf:Bag>
+        </dc:subject>
+      </cc:Work>
+      <cc:License
+         rdf:about="http://creativecommons.org/publicdomain/zero/1.0/">
+        <cc:permits
+           rdf:resource="http://creativecommons.org/ns#Reproduction" />
+        <cc:permits
+           rdf:resource="http://creativecommons.org/ns#Distribution" />
+        <cc:permits
+           rdf:resource="http://creativecommons.org/ns#DerivativeWorks" />
+      </cc:License>
+    </rdf:RDF>
+  </metadata>
+</svg>

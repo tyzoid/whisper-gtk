@@ -98,6 +98,12 @@ const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
 const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
 const NET_WM_STATE_ADD: c_long = 1;
 const NET_WM_STATE_SOURCE_APPLICATION: c_long = 1;
+const OVERLAY_MIC_ICON_HEIGHT: i32 = 20;
+const OVERLAY_MIC_ICON_ASPECT_RATIO: f64 = 462.86 / 688.86175;
+const OVERLAY_MIC_ICON_X: f64 = 16.0;
+const OVERLAY_MIC_ICON_Y: f64 = 10.0;
+const OVERLAY_WAVEFORM_X_PADDING: f64 = 12.0;
+const OVERLAY_WAVEFORM_RIGHT_PADDING: f64 = 10.0;
 
 pub struct OverlayUi {
     pub window: ApplicationWindow,
@@ -578,11 +584,26 @@ fn draw_overlay(cr: &gtk::cairo::Context, width: i32, height: i32, state: &Wavef
     rounded_rect(cr, 0.5, 0.5, width - 1.0, height - 1.0, radius - 0.5);
     let _ = cr.stroke();
 
-    draw_mic_icon(cr, 16.0, 10.0, 18.0, 20.0);
-    draw_waveform(cr, state, 46.0, 8.0, width - 56.0, height - 16.0);
+    let mic_height = OVERLAY_MIC_ICON_HEIGHT as f64;
+    let mic_width = overlay_mic_icon_width_for_height(mic_height);
+    draw_mic_icon(
+        cr,
+        OVERLAY_MIC_ICON_X,
+        OVERLAY_MIC_ICON_Y,
+        mic_width,
+        mic_height,
+    );
+
+    let waveform_x = OVERLAY_MIC_ICON_X + mic_width + OVERLAY_WAVEFORM_X_PADDING;
+    let waveform_width = width - waveform_x - OVERLAY_WAVEFORM_RIGHT_PADDING;
+    draw_waveform(cr, state, waveform_x, 8.0, waveform_width, height - 16.0);
 }
 
 fn draw_mic_icon(cr: &gtk::cairo::Context, x: f64, y: f64, width: f64, height: f64) {
+    if draw_overlay_svg_mic_icon(cr, x, y, width, height) {
+        return;
+    }
+
     let center_x = x + width / 2.0;
     let top = y + height * 0.16;
     let body_height = height * 0.5;
@@ -618,6 +639,85 @@ fn draw_mic_icon(cr: &gtk::cairo::Context, x: f64, y: f64, width: f64, height: f
         TAU,
     );
     let _ = cr.stroke();
+}
+
+fn draw_overlay_svg_mic_icon(
+    cr: &gtk::cairo::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> bool {
+    let Some(icon_surface) = overlay_mic_icon_surface() else {
+        return false;
+    };
+
+    let icon_width = icon_surface.width() as f64;
+    let icon_height = icon_surface.height() as f64;
+    if icon_width <= 0.0 || icon_height <= 0.0 {
+        return false;
+    }
+
+    let scale = height / icon_height;
+    let scaled_width = icon_width * scale;
+    let scaled_height = icon_height * scale;
+    let offset_x = x + (width - scaled_width) / 2.0;
+    let offset_y = y + (height - scaled_height) / 2.0;
+
+    let _ = cr.save();
+    cr.translate(offset_x, offset_y);
+    cr.scale(scale, scale);
+    cr.set_source_rgba(0.93, 0.96, 0.97, 0.94);
+    let _ = cr.mask_surface(&icon_surface, 0.0, 0.0);
+    let _ = cr.restore();
+    true
+}
+
+fn overlay_mic_icon_width_for_height(height: f64) -> f64 {
+    height * OVERLAY_MIC_ICON_ASPECT_RATIO
+}
+
+fn overlay_mic_icon_surface() -> Option<gtk::cairo::ImageSurface> {
+    thread_local! {
+        static OVERLAY_MIC_SURFACE: RefCell<Option<gtk::cairo::ImageSurface>> = const { RefCell::new(None) };
+    }
+
+    OVERLAY_MIC_SURFACE.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = load_overlay_mic_icon_surface().ok();
+        }
+        cell.borrow().clone()
+    })
+}
+
+fn load_overlay_mic_icon_surface() -> Result<gtk::cairo::ImageSurface, glib::Error> {
+    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type("svg")?;
+    loader.write(
+        std::fs::read("dist/icon_mic.svg")
+            .map_err(|err| glib::Error::new(glib::FileError::Failed, &err.to_string()))?
+            .as_slice(),
+    )?;
+    loader.close()?;
+    let pixbuf = loader.pixbuf().ok_or_else(|| {
+        glib::Error::new(
+            glib::FileError::Failed,
+            "failed to rasterize dist/icon_mic.svg for overlay",
+        )
+    })?;
+
+    let surface = gtk::cairo::ImageSurface::create(
+        gtk::cairo::Format::ARgb32,
+        pixbuf.width(),
+        pixbuf.height(),
+    )
+    .map_err(|err| glib::Error::new(glib::FileError::Failed, &err.to_string()))?;
+    let icon_cr = gtk::cairo::Context::new(&surface)
+        .map_err(|err| glib::Error::new(glib::FileError::Failed, &err.to_string()))?;
+    icon_cr.set_source_pixbuf(&pixbuf, 0.0, 0.0);
+    icon_cr
+        .paint()
+        .map_err(|err| glib::Error::new(glib::FileError::Failed, &err.to_string()))?;
+    Ok(surface)
 }
 
 fn draw_waveform(
