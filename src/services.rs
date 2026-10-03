@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, OutputMode};
+use crate::hotkey::{HotkeyChord, HotkeyReleaseGate, HotkeyState};
 use gtk::gdk;
 use gtk::prelude::DisplayExt;
 use libxdo::XDo;
@@ -1009,7 +1010,6 @@ union XEvent {
 }
 
 const KEY_PRESS: c_int = 2;
-const KEY_RELEASE: c_int = 3;
 const GRAB_MODE_ASYNC: c_int = 1;
 const MOD2_MASK: u32 = 1 << 4;
 const ANY_PROPERTY_TYPE: c_ulong = 0;
@@ -1085,6 +1085,8 @@ extern "C" {
     fn XStringToKeysym(string: *const c_char) -> c_ulong;
     fn XKeysymToKeycode(display: *mut XDisplay, keysym: c_ulong) -> u8;
     fn XQueryKeymap(display: *mut XDisplay, keys_return: *mut c_char) -> c_int;
+    fn XGetModifierMapping(display: *mut XDisplay) -> *mut XModifierKeymap;
+    fn XFreeModifiermap(modmap: *mut XModifierKeymap) -> c_int;
     fn XQueryTree(
         display: *mut XDisplay,
         window: c_ulong,
@@ -1216,55 +1218,35 @@ fn x11_modifier_token(token: &str) -> Option<c_uint> {
     }
 }
 
-unsafe fn hotkey_is_physically_down(
-    display: *mut XDisplay,
-    keymap: &[c_char; 32],
-    grab: ActiveGrab,
-) -> bool {
-    keycode_is_down(keymap, grab.keycode as u8)
-        && required_modifiers_are_down(display, keymap, grab.modifiers)
+#[repr(C)]
+struct XModifierKeymap {
+    max_keypermod: c_int,
+    modifiermap: *mut u8,
 }
 
-pub fn keycode_is_down(keymap: &[c_char; 32], keycode: u8) -> bool {
-    let index = (keycode / 8) as usize;
-    let bit = keycode % 8;
-    keymap
-        .get(index)
-        .map(|byte| (*byte as u8 & (1 << bit)) != 0)
-        .unwrap_or(false)
-}
-
-unsafe fn required_modifiers_are_down(
-    display: *mut XDisplay,
-    keymap: &[c_char; 32],
-    modifiers: c_uint,
-) -> bool {
-    (modifiers & SHIFT_MASK == 0 || any_keysym_is_down(display, keymap, &["Shift_L", "Shift_R"]))
-        && (modifiers & CONTROL_MASK == 0
-            || any_keysym_is_down(display, keymap, &["Control_L", "Control_R"]))
-        && (modifiers & MOD1_MASK == 0
-            || any_keysym_is_down(display, keymap, &["Alt_L", "Alt_R", "Meta_L", "Meta_R"]))
-        && (modifiers & MOD4_MASK == 0
-            || any_keysym_is_down(
-                display,
-                keymap,
-                &[
-                    "Super_L", "Super_R", "Hyper_L", "Hyper_R", "Meta_L", "Meta_R",
-                ],
-            ))
-}
-
-unsafe fn any_keysym_is_down(
-    display: *mut XDisplay,
-    keymap: &[c_char; 32],
-    names: &[&str],
-) -> bool {
-    names.iter().any(|name| {
-        let Ok(name) = CString::new(*name) else {
-            return false;
-        };
-        let keysym = XStringToKeysym(name.as_ptr());
-        keysym != 0 && keycode_is_down(keymap, XKeysymToKeycode(display, keysym))
+unsafe fn physical_hotkey_chord(display: *mut XDisplay, grab: ActiveGrab) -> Option<HotkeyChord> {
+    let map = XGetModifierMapping(display);
+    if map.is_null() {
+        return None;
+    }
+    let width = (*map).max_keypermod.max(0) as usize;
+    let mut modifier_keycodes = Vec::new();
+    for modifier in 0..8 {
+        if grab.modifiers & (1 << modifier) != 0 {
+            let mut codes = Vec::new();
+            for slot in 0..width {
+                let code = *(*map).modifiermap.add(modifier * width + slot);
+                if code != 0 {
+                    codes.push(code);
+                }
+            }
+            modifier_keycodes.push(codes);
+        }
+    }
+    XFreeModifiermap(map);
+    Some(HotkeyChord {
+        keycode: grab.keycode as u8,
+        modifier_keycodes,
     })
 }
 
@@ -1316,7 +1298,11 @@ unsafe fn uninstall_grab(display: *mut XDisplay, root: c_ulong, grab: ActiveGrab
     let _ = XSync(display, 0);
 }
 
-pub fn spawn_xev_hotkey_listener(config: Arc<Mutex<AppConfig>>, sender: Sender<crate::AppEvent>) {
+pub fn spawn_xev_hotkey_listener(
+    config: Arc<Mutex<AppConfig>>,
+    sender: Sender<crate::AppEvent>,
+    release_gate: Arc<HotkeyReleaseGate>,
+) {
     thread::spawn(move || unsafe {
         let display = XOpenDisplay(std::ptr::null());
         if display.is_null() {
@@ -1331,7 +1317,7 @@ pub fn spawn_xev_hotkey_listener(config: Arc<Mutex<AppConfig>>, sender: Sender<c
         let _ = XkbSetDetectableAutoRepeat(display, 1, &mut supported);
         let mut active_hotkey: Option<X11Hotkey> = None;
         let mut active_grab: Option<ActiveGrab> = None;
-        let mut hotkey_pressed = false;
+        let mut state = HotkeyState::default();
 
         loop {
             let configured_hotkey = config
@@ -1339,9 +1325,8 @@ pub fn spawn_xev_hotkey_listener(config: Arc<Mutex<AppConfig>>, sender: Sender<c
                 .ok()
                 .and_then(|guard| parse_x11_hotkey(&guard.hotkey));
             if configured_hotkey != active_hotkey {
-                if hotkey_pressed {
+                if state.stop_recording() {
                     let _ = sender.send(crate::AppEvent::HotkeyReleased);
-                    hotkey_pressed = false;
                 }
                 if let Some(grab) = active_grab.take() {
                     uninstall_grab(display, root, grab);
@@ -1350,51 +1335,41 @@ pub fn spawn_xev_hotkey_listener(config: Arc<Mutex<AppConfig>>, sender: Sender<c
                 active_grab = active_hotkey.and_then(|hotkey| install_grab(display, root, hotkey));
             }
 
-            if XPending(display) == 0 {
-                if hotkey_pressed {
-                    if let Some(grab) = active_grab {
-                        let mut keymap = [0 as c_char; 32];
-                        if XQueryKeymap(display, keymap.as_mut_ptr()) != 0
-                            && !hotkey_is_physically_down(display, &keymap, grab)
+            let pending = XPending(display) != 0;
+            if pending {
+                let mut event = std::mem::MaybeUninit::<XEvent>::zeroed();
+                let _ = XNextEvent(display, event.as_mut_ptr());
+                let key = event.assume_init().key;
+                if key.type_ == KEY_PRESS {
+                    if let (Some(hotkey), Some(grab)) = (active_hotkey, active_grab) {
+                        let keysym = XkbKeycodeToKeysym(display, key.keycode as u8, 0, 0);
+                        if keysym == hotkey.keysym
+                            && normalize_x11_mods(key.state) == hotkey.modifiers
                         {
-                            let _ = sender.send(crate::AppEvent::HotkeyReleased);
-                            hotkey_pressed = false;
+                            if let Some(chord) = physical_hotkey_chord(display, grab) {
+                                let mut keymap = [0 as c_char; 32];
+                                // Ignore stale queued presses. Releases (including synthetic
+                                // autorepeat releases) are handled by physical state below.
+                                if XQueryKeymap(display, keymap.as_mut_ptr()) != 0
+                                    && chord.is_down(&keymap)
+                                    && state.press(chord, &release_gate)
+                                {
+                                    let _ = sender.send(crate::AppEvent::HotkeyPressed);
+                                }
+                            }
                         }
                     }
                 }
-                thread::sleep(std::time::Duration::from_millis(50));
-                continue;
             }
 
-            let mut event = std::mem::MaybeUninit::<XEvent>::zeroed();
-            let _ = XNextEvent(display, event.as_mut_ptr());
-            let event = event.assume_init();
-            let key = event.key;
-
-            match key.type_ {
-                KEY_PRESS | KEY_RELEASE => {
-                    let Some(hotkey) = active_hotkey else {
-                        continue;
-                    };
-
-                    let keysym = XkbKeycodeToKeysym(display, key.keycode as u8, 0, 0);
-
-                    if keysym == hotkey.keysym && normalize_x11_mods(key.state) == hotkey.modifiers
-                    {
-                        match key.type_ {
-                            KEY_PRESS if !hotkey_pressed => {
-                                let _ = sender.send(crate::AppEvent::HotkeyPressed);
-                                hotkey_pressed = true;
-                            }
-                            KEY_RELEASE if hotkey_pressed => {
-                                let _ = sender.send(crate::AppEvent::HotkeyReleased);
-                                hotkey_pressed = false;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
+            let mut keymap = [0 as c_char; 32];
+            if XQueryKeymap(display, keymap.as_mut_ptr()) != 0
+                && state.update(&keymap, &release_gate)
+            {
+                let _ = sender.send(crate::AppEvent::HotkeyReleased);
+            }
+            if !pending {
+                thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     });
