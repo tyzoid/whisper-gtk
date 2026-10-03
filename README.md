@@ -4,7 +4,7 @@
 >
 > Note: Per US copyright law, works authored by AI are not protected by copyright, and are thus Public Domain. However, the human-authored elements of this project are protected by copyright, and are licensed under GPL v3.
 
-Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation. It listens for a configurable global hotkey, records microphone audio while the hotkey is held, shows a compact recording overlay, transcribes the capture with `whisper.cpp-base.en`, and inserts the resulting text into the active application. It also provides a StatusNotifier tray icon with Settings and Quit actions.
+Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation. It listens for a configurable global hotkey, records microphone audio while the hotkey is held, shows a compact recording overlay, transcribes the capture in-process with whisper.cpp via `whisper-rs` without requiring an external Whisper CLI, and inserts the resulting text into the active application. It also provides a StatusNotifier tray icon with Settings and Quit actions.
 
 ## Features
 
@@ -12,9 +12,11 @@ Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation.
 - PulseAudio capture through native `libpulse` / `libpulse-simple`
 - Small bottom-screen recording overlay with microphone icon and live waveform
 - Silence/short-recording gate to avoid transcribing blank audio
-- Transcription through `whisper.cpp-base.en`
+- In-process transcription through whisper.cpp via `whisper-rs`
+- Downloadable Whisper model picker in Settings, including cache-backed model discovery
+- Manual model file selection in Settings for existing local `.bin` models
 - Text output through `libxdo` or clipboard paste
-- GTK4 settings window for hotkey, audio source, output mode, and maximum recording duration
+- GTK4 settings window for hotkey, audio source, output mode, model selection, and maximum recording duration
 - StatusNotifier tray icon with Settings and Quit menu items
 - Arch Linux packaging files under `releng/arch`
 
@@ -28,6 +30,10 @@ Whisper GTK is a small Linux/X11 GTK4 background app for push-to-talk dictation.
 
 ![Whisper GTK settings dialog](screenshots/settings.png)
 
+### Model Download
+
+![Whisper GTK model download dialog](screenshots/model-download.png)
+
 ## Requirements
 
 Runtime:
@@ -36,7 +42,6 @@ Runtime:
 - GTK4
 - PulseAudio-compatible audio server
 - `libxdo.so` via the Arch `xdotool` package
-- `whisper.cpp-base.en` available on `PATH`
 
 Build time:
 
@@ -48,7 +53,7 @@ Build time:
 On Arch Linux, the package metadata lists:
 
 ```bash
-gtk4 glibc libgcc libx11 libxrandr libpulse xdotool whisper.cpp
+gtk4 glibc libgcc libx11 libxrandr libpulse xdotool
 ```
 
 ## Building
@@ -102,10 +107,17 @@ Exec=env GDK_BACKEND=x11 whisper-gtk
 1. Start `whisper-gtk`.
 2. Open Settings from the tray icon.
 3. Configure the hotkey, audio source, output mode, and maximum recording duration.
-4. Hold the hotkey to record.
-5. Release the hotkey to transcribe and insert the text.
+4. Choose a Whisper model from the dropdown, browse to an existing `.bin` file, or use `Download Models` to fetch one into the local cache.
+5. Hold the hotkey to record.
+6. Release the hotkey to transcribe and insert the text.
 
 If the recording is too short or too quiet, it is discarded without running Whisper.
+
+Downloaded models are stored under:
+
+```text
+~/.cache/whisper
+```
 
 ## Configuration
 
@@ -142,5 +154,4 @@ The current PKGBUILD is intended for this repository layout and builds from the 
 
 - Global hotkeys and text injection are X11-specific.
 - Native Wayland sessions are not currently supported.
-- `whisper.cpp-base.en` must be installed separately and available on `PATH`.
-- The app currently targets one transcription model command rather than exposing model selection in settings.
+- Model download and validation currently target GGML-format Whisper models supported by whisper.cpp / `whisper-rs`.
