@@ -2,6 +2,7 @@
 
 mod config;
 mod downloads;
+mod hotkey;
 mod native;
 mod services;
 #[cfg(test)]
@@ -9,6 +10,7 @@ mod tests;
 mod ui;
 
 use crate::config::AppConfig;
+use crate::hotkey::HotkeyReleaseGate;
 use crate::native::TrayIndicator;
 use crate::services::{
     focused_monitor_geometry, overlay_position_for_monitor, preload_whisper_state,
@@ -45,6 +47,7 @@ pub struct AppController {
     pub overlay_meter: OverlayMeter,
     pub tray: Option<TrayIndicator>,
     pub recording: Option<RecordingSession>,
+    pub hotkey_release_gate: Arc<HotkeyReleaseGate>,
     pub recording_generation: RecordingGeneration,
     pub preloaded_model: Option<JoinHandle<Option<WhisperState>>>,
     pub max_duration_timer: Option<gtk::glib::SourceId>,
@@ -72,6 +75,7 @@ impl AppController {
             overlay_meter: overlay.meter,
             tray: None,
             recording: None,
+            hotkey_release_gate: Arc::new(HotkeyReleaseGate::default()),
             recording_generation: RecordingGeneration::default(),
             preloaded_model: None,
             max_duration_timer: None,
@@ -199,6 +203,7 @@ impl AppController {
         let whisper_threads = cfg.whisper_threads as usize;
         let preloaded_model = self.preloaded_model.take();
         let had_preload = preloaded_model.is_some();
+        let release_gate = self.hotkey_release_gate.clone();
         self.next_transcription_sequence = self.next_transcription_sequence.saturating_add(1);
         std::thread::spawn(move || {
             let result = session.stop().and_then(|stop| {
@@ -214,18 +219,26 @@ impl AppController {
                     None => preload_whisper_state(configured_model_path.as_deref()).ok(),
                 };
                 match stop {
-                    RecordingStop::Captured(samples) => match model {
-                        Some(model) => {
-                            transcribe_with_state(model, &samples, whisper_threads).map(Some)
+                    RecordingStop::Captured(samples) => {
+                        // Capture stops promptly, including at the duration limit.
+                        // Model loading may finish while a new chord is held, so
+                        // check the release gate immediately before inference.
+                        release_gate.wait_until_released();
+                        match model {
+                            Some(model) => {
+                                transcribe_with_state(model, &samples, whisper_threads).map(Some)
+                            }
+                            None if had_preload => {
+                                Err(io::Error::other("whisper model was not preloaded"))
+                            }
+                            None => transcribe(
+                                &samples,
+                                configured_model_path.as_deref(),
+                                whisper_threads,
+                            )
+                            .map(Some),
                         }
-                        None if had_preload => {
-                            Err(io::Error::other("whisper model was not preloaded"))
-                        }
-                        None => {
-                            transcribe(&samples, configured_model_path.as_deref(), whisper_threads)
-                                .map(Some)
-                        }
-                    },
+                    }
                     RecordingStop::Discarded(stats) => {
                         eprintln!(
                             "recording discarded: duration={}ms speech={}ms",
@@ -260,10 +273,19 @@ impl AppController {
 
     fn finish_transcription(&mut self, sequence: u64, text: Option<String>) {
         self.pending_transcripts.insert(sequence, text);
-        while let Some(text) = self
-            .pending_transcripts
-            .remove(&self.next_transcription_to_output)
-        {
+        self.flush_pending_transcripts();
+    }
+
+    fn flush_pending_transcripts(&mut self) {
+        // A previous transcription may finish during the next recording.
+        // Check again between outputs in case another chord starts meanwhile.
+        while self.hotkey_release_gate.is_released() {
+            let Some(text) = self
+                .pending_transcripts
+                .remove(&self.next_transcription_to_output)
+            else {
+                break;
+            };
             self.next_transcription_to_output = self.next_transcription_to_output.saturating_add(1);
             let Some(text) = text else {
                 continue;
@@ -353,7 +375,11 @@ fn main() {
         }
         let shared_config: Arc<Mutex<AppConfig>> = controller.borrow().config.clone();
 
-        spawn_xev_hotkey_listener(shared_config.clone(), sender);
+        spawn_xev_hotkey_listener(
+            shared_config.clone(),
+            sender,
+            controller.borrow().hotkey_release_gate.clone(),
+        );
 
         let controller_weak: Weak<RefCell<AppController>> = Rc::downgrade(&controller);
         gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
@@ -369,6 +395,9 @@ fn main() {
                         }
                     }
                 }
+            }
+            if let Some(controller) = controller_weak.upgrade() {
+                controller.borrow_mut().flush_pending_transcripts();
             }
             gtk::glib::ControlFlow::Continue
         });

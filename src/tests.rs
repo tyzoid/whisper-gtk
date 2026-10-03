@@ -3,8 +3,9 @@ use crate::downloads::{
     download_whisper_models_with, list_downloadable_whisper_models, model_selection_after_refresh,
     DownloadableWhisperModel, WhisperModelDownloadEvent,
 };
+use crate::hotkey::keycode_is_down;
 use crate::services::{
-    append_recorded_s16le_chunk, hotkey_matches, keycode_is_down, list_whisper_models_from_roots,
+    append_recorded_s16le_chunk, hotkey_matches, list_whisper_models_from_roots,
     list_whisper_models_in, overlay_position_for_monitor, parse_x11_hotkey, raw_to_wav, AudioStats,
     Hotkey, MonitorGeometry, RecordingGeneration,
 };
